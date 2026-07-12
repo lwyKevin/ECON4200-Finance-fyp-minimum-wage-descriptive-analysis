@@ -1,0 +1,1719 @@
+---
+title: "ECON4200 - Hong Kong Statutory Minimum Wage Analysis\nEducation"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    fig_crop: false
+
+header-includes:
+  - \usepackage[table]{xcolor}
+  - \usepackage{booktabs}
+  - \usepackage{caption}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{colortbl}
+
+date: "2026-04-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  dev = "cairo_pdf",
+  out.width = "100%",
+  cache = FALSE,
+  fig.path = "figs/"
+)
+options(scipen = 999)
+```
+
+
+
+# setting up again
+## Load Libraries & Define Mappings
+load lib
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ggridges)
+library(Hmisc)
+library(kableExtra)
+library(knitr)
+```
+done load lib
+
+
+
+load earning map
+```{r, echo=TRUE}
+earnings_map <- tibble(
+  code = str_pad(1:40, width = 2, pad = "0"),
+  midpoint_hkd = c(1000,2500,3500,4500,5500,6500,7500,8500,9500,
+                   10500,11500,12500,13500,14500,15500,16500,17500,
+                   18500,19500,21000,23000,25000,27000,29000,31000,
+                   33000,35000,37000,39000,41000,43000,45000,47000,
+                   49000,55000,65000,75000,85000,95000,120000)
+)
+
+other_earnings_map <- tibble(
+  code = str_pad(1:11, width = 2, pad = "0"),
+  midpoint_hkd = c(500,1500,2500,3500,4500,5500,6500,7500,8500,9500,12000)
+)
+```
+done load earning map
+
+
+## Data Loading & Processing
+Load all files + calculate est hourly wage
+same method used
+```{r}
+files <- list.files("data_csv", pattern = "*.csv", full.names = TRUE)
+df_raw <- files %>% map_df(~read_csv(.x, col_types = cols(.default = "c")))
+
+df <- df_raw %>%
+  mutate(
+    year_quarter = str_trim(as.character(year_quarter)),
+    year = as.integer(str_sub(year_quarter, 1, 4)),
+    quarter = as.integer(str_sub(year_quarter, 5, 5)),
+    date = yq(paste0(year, "-Q", quarter)),
+    
+    across(c(earnings_main, earnings_employed, earnings_other),
+           ~ str_pad(as.character(.), width = 2, pad = "0", side = "left")),
+    
+    earnings_main_hkd     = earnings_map$midpoint_hkd[match(earnings_main, earnings_map$code)],
+    earnings_employed_hkd = earnings_map$midpoint_hkd[match(earnings_employed, earnings_map$code)],
+    earnings_other_hkd    = other_earnings_map$midpoint_hkd[match(earnings_other, other_earnings_map$code)],
+    
+    across(c(hours_main_employment, hours_7days),
+           ~ case_when(.x %in% c("999","99","","NA") ~ NA_real_, TRUE ~ as.numeric(.x))),
+    
+    hourly_wage = case_when(
+      !is.na(earnings_main_hkd) & !is.na(hours_main_employment) & hours_main_employment > 0 ~
+        earnings_main_hkd / (hours_main_employment * 4.345),
+      !is.na(earnings_employed_hkd) & !is.na(hours_7days) & hours_7days > 0 ~
+        earnings_employed_hkd / (hours_7days * 4.345),
+      TRUE ~ NA_real_
+    ),
+    
+    is_employed       = economic_status %in% c("1","2","3"),
+    working_age       = age %in% str_pad(4:13, 2, pad = "0"),
+    not_foreign_helper = foreign_helper != "1" | is.na(foreign_helper),
+    not_underemployed  = underemployed != "1",
+    weight = as.numeric(grossing_up_factor) / 1e12
+  ) %>%
+  filter(!is.na(date), year >= 1985)
+
+
+```
+done
+
+ranges mapping
+```{r}
+df_focus <- df %>%
+  filter(is_employed, working_age, not_foreign_helper, not_underemployed,
+         !is.na(hourly_wage), hourly_wage > 0,
+         hours_main_employment >= 8 | is.na(hours_main_employment)) %>%
+  mutate(
+    year_group = case_when(
+      year <= 1989 ~ "1985-1989",
+      year >= 1990 & year <= 1994 ~ "1990-1994",
+      year >= 1995 & year <= 1999 ~ "1995-1999",
+      year >= 2000 & year <= 2004 ~ "2000-2004",
+      year >= 2005 & year <= 2009 ~ "2005-2009",
+      year >= 2010 & year <= 2012 ~ "2010-2012",
+      TRUE ~ "Other"
+    )
+  )
+```
+done
+
+
+
+## CPI Processing (Real Wages)
+```{r}
+raw_cpi <- read_csv("Table 510-60001_en.csv", skip = 4)
+
+cleaned_cpi <- raw_cpi %>%
+  rename(Year = 1, Month = 2, Comp_Index = 3, CPIA_Index = 6) %>%
+  fill(Year) %>%
+  filter(!is.na(Month)) %>%
+  mutate(Year = as.numeric(Year)) %>% 
+  mutate(across(c(Comp_Index, CPIA_Index), as.numeric)) %>%
+  filter(Year >= 1985 & Year <= 2012)
+
+cpi_quarterly <- cleaned_cpi %>%
+  mutate(quarter = case_when(
+    Month %in% c("Jan", "Feb", "Mar") ~ 1,
+    Month %in% c("Apr", "May", "Jun") ~ 2,
+    Month %in% c("Jul", "Aug", "Sep") ~ 3,
+    Month %in% c("Oct", "Nov", "Dec") ~ 4
+  )) %>%
+  dplyr::group_by(Year, quarter) %>%
+  dplyr::summarise(
+    cpi_comp = mean(Comp_Index, na.rm = TRUE),
+    cpi_a = mean(CPIA_Index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ref_cpi <- cpi_quarterly %>%
+  filter(Year == 2011, quarter == 2) %>%
+  pull(cpi_comp)
+
+print(paste("2011 Q2 Reference CPI Value is:", ref_cpi))
+```
+done
+
+## Add Real Wage to Main Dataset
+```{r}
+df_focus <- df_focus %>%
+  left_join(cpi_quarterly, by = c("year" = "Year", "quarter" = "quarter")) %>%
+  mutate(real_hourly_wage = (hourly_wage / cpi_comp) * ref_cpi)
+```
+done adding real wage
+
+## Testing to reconfirm is same as previous rmd file
+```{r data-validation}
+cat("=== Basic Data Overview ===\n")
+cat("Total rows in raw data:", nrow(df_raw), "\n")
+cat("Total rows after processing:", nrow(df), "\n")
+cat("Rows in focus sample:", nrow(df_focus), "\n\n")
+
+cat("Years covered:\n")
+print(df_focus %>% count(year, quarter) %>% arrange(year, quarter))
+
+cat("\n=== Key Variable Summary ===\n")
+summary(df_focus %>% select(hourly_wage, real_hourly_wage, weight, 
+                            hours_main_employment, earnings_main_hkd))
+
+cat("\n=== Missing Values (%) ===\n")
+df_focus %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_%") %>%
+  filter(`Missing_%` > 0) %>%
+  arrange(desc(`Missing_%`)) %>%
+  print()
+
+cat("\n=== Hourly Wage Distribution (Nominal) ===\n")
+df_focus %>%
+  summarise(
+    Min = min(hourly_wage, na.rm = TRUE),
+    P5 = quantile(hourly_wage, 0.05, na.rm = TRUE),
+    Median = median(hourly_wage, na.rm = TRUE),
+    Mean = mean(hourly_wage, na.rm = TRUE),
+    P95 = quantile(hourly_wage, 0.95, na.rm = TRUE),
+    Max = max(hourly_wage, na.rm = TRUE),
+    N = n()
+  ) %>% 
+  kable(digits = 2)
+```
+
+### 1. Check Earnings Mapping
+```{r check-earnings-mapping}
+cat("Unique earnings_main codes and their mapped values:\n")
+df_focus %>%
+  count(earnings_main, earnings_main_hkd) %>%
+  arrange(earnings_main) %>%
+  print(n = 30)
+```
+
+### 2. Check Weighting Factor
+```{r check-weights}
+cat("Total weighted population (should be around Hong Kong's employed population):\n")
+sum(df_focus$weight, na.rm = TRUE) %>% round(3)
+```
+
+
+### 3. Sample of Raw vs Processed Data
+yea this one isnt going to be same but uh it exist
+```{r sample-data}
+df_focus %>%
+  select(year, quarter, earnings_main, earnings_main_hkd, 
+         hours_main_employment, hourly_wage, real_hourly_wage) %>%
+  slice_sample(n = 10) %>%
+  kable(digits = 2)
+```
+
+
+
+Now actual content
+
+Cont.
+The aggregate data shows a continued improvement in wages and a reduction in the low-wage share around 2011, the effect appears modest in the overall population. This raises the question of whether the minimum wage had a stronger impact on specific vulnerable groups.
+Therefore, the next step is to conduct a more disaggregated analysis by examining subgroups such as:
+- Workers with lower education levels
+
+# Education Grouping (Handle code change in 2012)
+
+From Q1 1985 to Q4 2011
+Code Description
+1 No schooling / pre-primary
+2 Primary
+3 Lower secondary
+4 Upper secondary
+5 Six form
+6 Technical / vocational training
+7 Tertiary (non-degree courses)
+8 Tertiary (First degree courses)
+9 Tertiary (Post-degree courses)
+
+From Q1 2012 to current
+Code Description
+1 No schooling / pre-primary
+2 Primary
+3 Lower secondary
+4 Upper secondary
+5 Post-secondary – diploma /
+certificate including craft
+6 Post-secondary – sub-degree
+7 Post-secondary – first degree
+8 Post-secondary – post-degree
+
+
+Then we have to do some recode mapping from numbers to words 
+
+Codes 1–4: No recoding needed, meanings identical across both periods
+
+Code 5 (pre-2012): Kept as "Sixth Form", this is academic pre-university, distinct from upper secondary (code 4)
+
+Code 5 (post-2012): Labeled "Post-secondary Diploma/Certificate", different meaning from pre-2012 code 5, so kept separate
+
+Code 6 (pre-2012): Labeled "Technical / Vocational", preserved as distinct category
+
+Code 6 (post-2012): Labeled "Post-secondary Sub-degree", different meaning from pre-2012 code 6, kept separate
+
+Code 7 (pre-2012): Labeled "Tertiary Non-degree", below bachelor level, preserved as distinct category
+
+Code 7 (post-2012): Mapped to "Bachelor's Degree", conceptually equivalent to pre-2012 code 8
+
+Code 8 (pre-2012): Mapped to "Bachelor's Degree", conceptually equivalent to post-2012 code 7
+
+Code 8 (post-2012): Mapped to "Postgraduate", conceptually equivalent to pre-2012 code 9
+
+Code 9 (pre-2012): Mapped to "Postgraduate", no equivalent in post-2012 scheme
+
+Codes 99, 999, blank, NA: Coded as "Unknown / Missing"
+
+
+
+
+
+
+
+
+```{r education-grouping}
+# Education recoding with clearer naming
+df_focus <- df_focus %>%
+  mutate(
+    education_code = as.character(education),
+    
+    educ_group = case_when(
+      # Primary and below
+      education_code %in% c("1", "2") ~ "No Schooling / Primary",
+      education_code == "3"           ~ "Lower Secondary",
+      education_code == "4"           ~ "Upper Secondary",
+      
+      # Code 5 transition
+      education_code == "5" & year <= 2011 ~ "Sixth Form",
+      education_code == "5" & year >= 2012 ~ "Post-secondary Diploma/Certificate",
+      
+      # Code 6 transition
+      education_code == "6" & year <= 2011 ~ "Technical / Vocational",
+      education_code == "6" & year >= 2012 ~ "Post-secondary Sub-degree",
+      
+      # Code 7 transition
+      education_code == "7" & year <= 2011 ~ "Tertiary Non-degree",
+      education_code == "7" & year >= 2012 ~ "First Degree",
+      
+      # Code 8 transition
+      education_code == "8" & year <= 2011 ~ "First Degree",
+      education_code == "8" & year >= 2012 ~ "Post Degree",
+      
+      # Code 9 (pre-2012 only)
+      education_code == "9" & year <= 2011 ~ "Post Degree",
+      
+      # Missing
+      is.na(education) | education_code %in% c("", "99", "999") ~ "Unknown / Missing",
+      TRUE ~ "Other"
+    ),
+    
+    educ_broad = case_when(
+      # Lower education
+      education_code %in% c("1", "2", "3") ~ "Lower Education",
+      
+      # Secondary + Vocational (including non-degree tertiary pre-2012)
+      education_code %in% c("4", "5", "6") ~ "Secondary + Vocational",
+      (education_code == "7" & year <= 2011) ~ "Secondary + Vocational",
+      
+      # Tertiary (Degree) - First Degree and Post Degree
+      (education_code == "7" & year >= 2012) ~ "Tertiary (Degree)",
+      (education_code == "8" & year <= 2011) ~ "Tertiary (Degree)",
+      (education_code == "8" & year >= 2012) ~ "Tertiary (Degree)",
+      (education_code == "9" & year <= 2011) ~ "Tertiary (Degree)",
+      
+      TRUE ~ "Unknown / Missing"
+    )
+  )
+```
+
+# Education distribution
+
+Let's check the education distribution:
+
+```{r}
+# Check education distribution
+df_focus %>%
+  count(educ_group, educ_broad) %>%
+  arrange(desc(n)) %>%
+  mutate(pct = round(n / sum(n) * 100, 2))
+```
+
+```{r}
+cat("Percentage of Unknown education in focus sample:", 
+    round(mean(df_focus$educ_group == "Unknown / Missing") * 100, 2), "%\n")
+```
+
+2.4% unknown edu, we can filter them to make final graphs/tables cleaner
+
+```{r}
+df_focus <- df_focus  %>% filter(educ_group != "Unknown / Missing")
+
+cat("Percentage of Unknown education in focus sample after filtering yes this is going to be 0%:", 
+    round(mean(df_focus$educ_group == "Unknown / Missing") * 100, 2), "%\n")
+```
+
+# Figure 1: Proportion Below HK 28 by Education Group
+
+```{r fig.width=15, fig.height=15, out.width="100%"}
+# Proportion below real $28 by education
+prop_educ <- df_focus %>%
+  filter(educ_group != "Unknown / Missing") %>%
+  group_by(year, educ_group) %>%
+  summarise(
+    below_28 = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(year >= 2002)
+
+ggplot(prop_educ, aes(x = year, y = below_28, color = educ_group)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.2) +
+  geom_text(aes(label = round(below_28, 1)), 
+            vjust = -0.8, size = 3.5, show.legend = FALSE) +   # ← Data labels
+  scale_x_continuous(breaks = seq(2002, 2012, by = 2)) +
+  labs(title = "Proportion Earning Below Real HK$28 by Education Level",
+       subtitle = "Real wages in 2011 prices",
+       x = "Year", y = "Proportion (%)") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+
+
+```{r fig.width=15, fig.height=15, out.width="100%"}
+# Identify education groups with sufficient data points
+valid_groups <- prop_educ %>%
+  group_by(educ_group) %>%
+  summarise(n_years = n(), .groups = "drop") %>%
+  filter(n_years >= 3) %>%
+  pull(educ_group)
+
+# Filter and plot
+prop_educ_filtered <- prop_educ %>%
+  filter(educ_group %in% valid_groups)
+
+ggplot(prop_educ_filtered, aes(x = year, y = below_28, color = educ_group)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.2) +
+  geom_text(aes(label = round(below_28, 1)), 
+            vjust = -0.8, size = 3.5, show.legend = FALSE) +
+  scale_x_continuous(breaks = seq(2002, 2012, by = 2)) +
+  labs(title = "Proportion Earning Below Real HK$28 by Education Level",
+       subtitle = "Real wages in 2011 prices | Groups with sufficient pre/post data",
+       x = "Year", y = "Proportion (%)") +
+  
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", linewidth = 0.8) +
+annotate("text", x = 2011, y = Inf, label = "SMW", color = "red", size = 4, hjust = -0.2, vjust = 1.5)+
+  
+  
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+## Key Findings from the Education Analysis
+
+Yes the changes are quite significant to the point you can directly use your eyes to see some big different but anyways
+
+### 1. Strongest Impact on the Least Educated Workers
+
+Workers with No Schooling / Primary education consistently had the highest share of low-wage earners in their own group, like maybe no schooling 100 people has like 25 people are wage < 28 hkd vs upper school maybe 100 people has like 5 people only are wage < 28 hkd etc
+
+BUT the thing is, in 2011 compared to 2010 there is a big drop of proportion, like 25/100 ppl then 2011 become 17/100 which is quite some huge improvement
+
+### 2. Limited Impact on Better-Educated Workers
+
+I know i know the lines are "broke off" in 2012 but ignoring the broken line you can kinda know which is which
+
+but either way that's not the most important, the most important is that
+
+Upper Secondary, Sixth Form, and Post-secondary groups had much lower exposure to wages below $28 even before the policy.
+
+Tertiary-educated workers (Bachelor’s, Postgraduate, etc.) had very low proportions (< 3–4%) throughout the period, with almost no meaningful change after 2011.
+
+### 3. The Policy Accelerated an Existing Trend
+
+There was already a gradual downward trend in low-wage employment before 2011 (due to economic growth and structural changes) yes i know there are highs and ups and downs but the overall trend is decreasing.
+
+However, the speed of decline increased noticeably in 2010 vs 2011, especially for No Schooling/Primary and Lower Secondary groups, consistent with the minimum wage taking effect in May 2011.
+
+
+
+
+# YoY % Change Tables and actual values by Education Group
+
+Let's see the YoY and actual of different edu group yes it is going to be % change = (new - old)/old x 100%
+
+we see actual values cuz the graphs even i fig.width=10, fig.height=15, out.width="100%" still has some data label overlapping each other
+
+yes if they are some newly changed edu group in 2012 data then there is NOT going to be previous year comparison so they maybe NA on the % change, same reason if you are seeing removed and 2012 is gone
+
+but we mainly care about the no schooling / primary AND lower secondary cuz 1. they are low edu 2. their % change are largest
+
+
+```{r}
+
+educ_groups <- df_focus %>%
+  filter(educ_group != "Unknown / Missing") %>%
+  pull(educ_group) %>% unique()
+
+for (group in sort(educ_groups)) {
+  cat("\n##", group, "\n\n")
+  
+  table_data <- df_focus %>%
+    filter(educ_group == group, year >= 2007, year <= 2012) %>%   # ← Include 2007
+    group_by(year) %>%
+    summarise(
+      `Below $28` = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+      `Below $35` = round(weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100, 1),
+      `Below $40` = round(weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100, 1),
+      .groups = "drop"
+    ) %>%
+    arrange(year) %>%
+    mutate(
+      `YoY $28` = round((`Below $28` - lag(`Below $28`)) / lag(`Below $28`) * 100, 1),
+      `YoY $35` = round((`Below $35` - lag(`Below $35`)) / lag(`Below $35`) * 100, 1),
+      `YoY $40` = round((`Below $40` - lag(`Below $40`)) / lag(`Below $40`) * 100, 1)
+    ) %>%
+    filter(year >= 2008) %>%   # Show only 2008–2012
+    select(year, 
+           `Below $28`, `YoY $28`, 
+           `Below $35`, `YoY $35`, 
+           `Below $40`, `YoY $40`)
+  
+  print(kable(table_data, 
+              caption = paste("Proportion Below Thresholds & YoY % Change -", group),
+              align = "r"))
+  
+  cat("\n")
+}
+```
+
+
+# Before vs After May 2011: Changes by Educational Attainment
+
+To more directly assess the immediate impact of the Statutory Minimum Wage implemented in May 2011, we compare the proportion of workers earning below various hourly wage thresholds in the period **2008Q1–2011Q1 (Before)** VS **2011Q2–2012Q4 (After)**.
+
+
+
+Why We Show 3 Thresholds ($28, $35, $40) Instead of Just $28
+
+1. To show the depth of the policy's impact
+
+$28 = The actual Statutory Minimum Wage (the legal floor).
+
+$35 and $40 = Slightly higher thresholds to see if the policy also helped workers who were earning just above the minimum wage (a "ripple effect" or "spillover effect").
+
+If only the $28 bar drops significantly while $35 and $40 stay almost the same, it means the minimum wage mainly pushed people up to the floor, but didn't help much beyond that.
+If all three drop, it suggests a broader compression of the lower wage distribution.
+
+
+2. To make the analysis more robust and convincing
+
+Relying on only one threshold ($28) is risky — it could be affected by measurement error or specific data quirks.
+
+Showing multiple thresholds makes your conclusion stronger and more credible to readers/professors.
+
+3. Academic / Policy Relevance
+
+In minimum wage research, it's very common to examine effects at:
+
+The exact minimum wage
+10–20% above the minimum wage
+
+
+This helps answer:
+→ "Did the policy only affect the very bottom, or did it lift a wider group of low-wage workers?"
+
+
+
+
+
+**NO need to keep all three separate plots in the final report if space is limited.**
+
+
+
+## Below $28 graph
+MAKE IT 2011Q1 VS 2011Q3
+
+```{r}
+# Before vs After by Education - Multiple Thresholds (Vertical)
+event_educ_multi <- df_focus %>%
+  filter(year >= 2008, year <= 2012,
+         educ_group != "Unknown / Missing") %>%
+  mutate(
+    period = if_else(date < as.Date("2011-05-01"), 
+                     "Before (Real)", 
+                     "After (Real)")
+  ) %>%
+  group_by(period, educ_group) %>%
+  summarise(
+    `Below $28` = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below $35` = weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below $40` = weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+event_educ_long <- event_educ_multi %>%
+  pivot_longer(cols = starts_with("Below"), 
+               names_to = "threshold", 
+               values_to = "proportion")
+
+# Plot 1: Below $28
+ggplot(event_educ_long %>% filter(threshold == "Below $28"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$28",
+       subtitle = "Before vs After May 2011",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (Real)" = "grey60", "After (Real)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+## Below $35 graph
+
+```{r}
+# Plot 2: Below $35
+ggplot(event_educ_long %>% filter(threshold == "Below $35"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$35",
+       subtitle = "Before vs After May 2011",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (Real)" = "grey60", "After (Real)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Below $40 graph
+
+```{r}
+# Plot 3: Below $40
+ggplot(event_educ_long %>% filter(threshold == "Below $40"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$40",
+       subtitle = "Before vs After May 2011",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (Real)" = "grey60", "After (Real)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Summary Table: Before vs After by Education (Below $28)
+
+Yes it is EXTREMELY NORMAL THE RELATIVE CHANGE IS NOT EQUAL TO PREVIOUS YOY
+
+Relative Change (%) Compares the average of the whole Before period (2008Q1–2011Q1) vs the whole After period (2011Q2–2012Q4). This is the overall policy impact.
+
+YoY Tables shows year-to-year changes (e.g. 2010 → 2011, 2011 → 2012). These include normal economic fluctuations
+
+```{r}
+# Fixed Summary Table
+summary_table <- df_focus %>%
+  filter(year >= 2008, year <= 2012,
+         educ_group != "Unknown / Missing") %>%
+  mutate(period = if_else(date < as.Date("2011-05-01"), "Before", "After")) %>%
+  group_by(educ_group, period) %>%
+  summarise(
+    `Below $28 (%)` = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = period, values_from = `Below $28 (%)`) %>%
+  mutate(
+    `Change (pp)` = round(After - Before, 1),
+    `Relative Change (%)` = round((After - Before) / Before * 100, 1)
+  ) %>%
+  arrange(`Change (pp)`)
+
+kable(summary_table, 
+      caption = "Before vs After May 2011: Proportion Below Real HK dollar 28 by Education Group",
+      digits = 1,
+      align = "lrrrr") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE)
+```
+
+The -45.1% in the summary table is more important for the conclusion because it shows the total effect of the policy.
+
+
+# RIGHT Before and After, 2011Q1 vs 2011Q3
+```{r}
+# === RIGHT BEFORE vs RIGHT AFTER (2011Q1 vs 2011Q3) ===
+
+event_educ_sharp <- df_focus %>%
+  filter(educ_group != "Unknown / Missing",
+         (year == 2011 & quarter == 1) | (year == 2011 & quarter == 3)) %>%
+  mutate(
+    period = if_else(quarter == 1, 
+                     "Before (2011Q1)", 
+                     "After (2011Q3)")
+  ) %>%
+  group_by(period, educ_group) %>%
+  summarise(
+    `Below $28` = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below $35` = weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below $40` = weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+event_educ_sharp_long <- event_educ_sharp %>%
+  pivot_longer(cols = starts_with("Below"), 
+               names_to = "threshold", 
+               values_to = "proportion")
+
+# Plot 1: Below $28
+ggplot(event_educ_sharp_long %>% filter(threshold == "Below $28"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$28",
+       subtitle = "Right Before (2011Q1) vs Right After (2011Q3)",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 2: Below $35
+ggplot(event_educ_sharp_long %>% filter(threshold == "Below $35"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$35",
+       subtitle = "Right Before (2011Q1) vs Right After (2011Q3)",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 3: Below $40
+ggplot(event_educ_sharp_long %>% filter(threshold == "Below $40"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$40",
+       subtitle = "Right Before (2011Q1) vs Right After (2011Q3)",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+
+```{r}
+# RIGHT BEFORE and AFTER, 2011Q1 vs 2011Q3 (Excluding Post Degree)
+
+# Create new dataframe excluding Post Degree
+event_educ_sharp_no_post <- df_focus %>%
+  filter(educ_group != "Unknown / Missing",
+         educ_group != "Post Degree",  # Exclude Post Degree
+         (year == 2011 & quarter == 1) | (year == 2011 & quarter == 3)) %>%
+  mutate(
+    period = if_else(quarter == 1, 
+                     "Before (2011Q1)", 
+                     "After (2011Q3)")
+  ) %>%
+  group_by(period, educ_group) %>%
+  summarise(
+    `Below $28` = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below $35` = weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below $40` = weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+event_educ_sharp_long_no_post <- event_educ_sharp_no_post %>%
+  pivot_longer(cols = starts_with("Below"), 
+               names_to = "threshold", 
+               values_to = "proportion")
+
+# Plot 1: Below $28
+ggplot(event_educ_sharp_long_no_post %>% filter(threshold == "Below $28"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$28 (Excluding Post Degree)",
+       subtitle = "Right Before (2011Q1) vs Right After (2011Q3)",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 2: Below $35
+ggplot(event_educ_sharp_long_no_post %>% filter(threshold == "Below $35"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$35 (Excluding Post Degree)",
+       subtitle = "Right Before (2011Q1) vs Right After (2011Q3)",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 3: Below $40
+ggplot(event_educ_sharp_long_no_post %>% filter(threshold == "Below $40"), 
+       aes(x = educ_group, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  labs(title = "Below Real HK$40 (Excluding Post Degree)",
+       subtitle = "Right Before (2011Q1) vs Right After (2011Q3)",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+## Summary table
+
+```{r}
+sharp_summary_educ <- event_educ_sharp %>%
+  select(period, educ_group, `Below $28`) %>%
+  pivot_wider(names_from = period, values_from = `Below $28`) %>%
+  mutate(
+    `Change (pp)` = round(`After (2011Q3)` - `Before (2011Q1)`, 1),
+    `Relative Change (%)` = round((`After (2011Q3)` - `Before (2011Q1)`) / `Before (2011Q1)` * 100, 1)
+  ) %>%
+  arrange(`Change (pp)`)
+
+kable(sharp_summary_educ, 
+      caption = "Right Before vs Right After (2011Q1 vs 2011Q3): Proportion Below HK dollar 28 by Education",
+      digits = 1) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+# Robustness Tests for Education
+
+## Test 1: False Timing Robustness (Lowest Education Group)
+
+Test whether the 2011 drop for "No Schooling / Primary" workers was historically unusual:
+
+
+```{r}
+placebo_edu_clean <- df_focus %>%
+  filter(educ_group == "No Schooling / Primary", 
+         year >= 1986, 
+         year <= 2011) %>%
+  group_by(year) %>%
+  summarise(prop = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE)) %>%
+  mutate(Drop = prop - lag(prop)) %>%
+  filter(!is.na(Drop)) %>%  # Remove NA rows (first year has no lag)
+  select(Year = year, Drop)
+
+# Convert to percentage points
+placebo_edu_clean <- placebo_edu_clean %>%
+  mutate(Drop_pp = Drop * 100)
+
+# Find largest pre-2011 drop
+largest_pre_drop <- placebo_edu_clean %>%
+  filter(Year < 2011) %>%
+  summarise(
+    largest_drop = min(Drop_pp),
+    year_of_largest = Year[which.min(Drop_pp)]
+  )
+
+cat("\nLargest pre-2011 drop:\n")
+print(largest_pre_drop)
+
+# Plot
+ggplot(placebo_edu_clean, aes(x = Year, y = Drop_pp, fill = ifelse(Year == 2011, "2011", "Robustness"))) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(Drop_pp, 1)), 
+            vjust = ifelse(placebo_edu_clean$Drop > 0, -0.5, 1.5), 
+            size = 3) +
+  scale_fill_manual(values = c("Robustness" = "grey70", "2011" = "darkred")) +
+  scale_x_continuous(breaks = seq(1986, 2011, by = 3)) +
+  labs(title = "Robustness Test: No Schooling / Primary Workers",
+       subtitle = paste0("Largest pre-2011 drop: ", 
+                         abs(round(largest_pre_drop$largest_drop, 1)), 
+                         " pp in ", largest_pre_drop$year_of_largest,
+                         " | 2011 drop: ", 
+                         abs(round(placebo_edu_clean$Drop_pp[placebo_edu_clean$Year == 2011], 1)), " pp"),
+       x = "Year", 
+       y = "Change in percentage points below HK$28 (YoY)\n(Negative = improvement)",
+       fill = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+placebo_edu_clean <- df_focus %>%
+  filter(educ_group == "No Schooling / Primary", 
+         year >= 1990, 
+         year <= 2011) %>%
+  group_by(year) %>%
+  summarise(prop = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE)) %>%
+  mutate(Drop = prop - lag(prop)) %>%
+  filter(!is.na(Drop)) %>%  # Remove NA rows (first year has no lag)
+  select(Year = year, Drop)
+
+# Convert to percentage points
+placebo_edu_clean <- placebo_edu_clean %>%
+  mutate(Drop_pp = Drop * 100)
+
+# Find largest pre-2011 drop
+largest_pre_drop <- placebo_edu_clean %>%
+  filter(Year < 2011) %>%
+  summarise(
+    largest_drop = min(Drop_pp),
+    year_of_largest = Year[which.min(Drop_pp)]
+  )
+
+cat("\nLargest pre-2011 drop:\n")
+print(largest_pre_drop)
+
+# Plot
+ggplot(placebo_edu_clean, aes(x = Year, y = Drop_pp, fill = ifelse(Year == 2011, "2011", "Robustness"))) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(Drop_pp, 1)), 
+            vjust = ifelse(placebo_edu_clean$Drop > 0, -0.5, 1.5), 
+            size = 3) +
+  scale_fill_manual(values = c("Robustness" = "grey70", "2011" = "darkred")) +
+  #scale_x_continuous(breaks = seq(1986, 2011, by = 3)) +
+  labs(title = "Robustness Test: Real Wage YoY% change of No Schooling / Primary Workers",
+
+       x = "Year", 
+       y = "Change in percentage points below HK$28 (YoY)",
+       fill = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+## Test 2: Quarterly Robustness for Lowest Education Group
+
+
+```{r}
+# Quarterly Robustness for No Schooling / Primary
+quarterly_edu <- df_focus %>%
+  filter(educ_group == "No Schooling / Primary", year >= 2008, year <= 2012) %>%
+  group_by(year, quarter) %>%
+  summarise(
+    below_28 = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  mutate(year_quarter = paste0(year, "Q", quarter))
+
+ggplot(quarterly_edu, aes(x = year_quarter, y = below_28, group = 1)) +
+  geom_line(color = "blue", linewidth = 1.1) +
+  geom_point(size = 3) +
+  geom_text(aes(label = below_28), vjust = -0.8, size = 3) +
+  geom_vline(xintercept = "2011Q2", linetype = "dashed", color = "red") +
+  annotate("text", x = "2011Q2", y = max(quarterly_edu$below_28) + 2, 
+           label = "SMW Started", color = "red", hjust = -0.1) +
+  labs(title = "Quarterly Robustness Test: No Schooling / Primary Workers",
+       subtitle = "Proportion Below HK$28 Over Time",
+       x = "Year-Quarter", y = "Proportion Below HK$28 (%)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Small summary i guess?
+
+1. Largest Impact on the Least Educated
+
+Workers with No Schooling / Primary education experienced the most dramatic improvement. The proportion earning below HK$28 dropped sharply from 23.5% (Before) to 12.9% (After), a reduction of over 10 percentage points.
+
+Lower Secondary workers also saw a substantial decline (14.1% → 8.0%).
+
+
+
+
+2. Lower Secondary workers also saw a substantial decline (14.1% → 8.0%).
+
+For workers with Upper Secondary, Sixth Form, and Post-secondary qualifications, the reductions were much smaller.
+
+Tertiary-educated workers (Bachelor’s Degree and above) had very low exposure to sub-$28 wages even before the policy, so the impact was minimal (as expected).
+
+
+3. Clearer Effect at Lower Thresholds
+
+The policy’s effect is strongest at $28, still visible at $35, and weaker at $40. This pattern confirms that the minimum wage primarily lifted the lowest-paid workers rather than causing a broad upward shift across all low-wage earners.
+
+
+
+
+# Summary?
+
+The disaggregated analysis by educational attainment demonstrates that the Statutory Minimum Wage had a strongly progressive distributional impact.
+
+The policy led to the largest reductions in the incidence of very low pay among workers with the lowest levels of education, aka those with No Schooling/Primary and Lower Secondary qualifications.
+
+In the before-after comparison (2008Q1–2011Q1 vs 2011Q2–2012Q4), these groups experienced the most substantial declines in the proportion earning below HK$28 (real terms).
+
+In contrast, the effect on tertiary-educated workers was negligible, as expected given their already higher wage levels.
+
+**These findings suggest that the minimum wage was relatively successful in targeting and improving labour market outcomes for the most vulnerable segments of the Hong Kong workforce.**
+
+
+
+
+# Limitations
+
+While the before-after comparison and disaggregated analysis by education show a clear reduction in low-wage employment coinciding with the implementation of the minimum wage, several limitations should be noted.
+
+First, the Labour Force Survey is a repeated cross-sectional dataset, meaning we cannot track the same individuals over time.
+
+Second, the period 2011–2012 also coincided with economic recovery, which may have independently contributed to wage growth.
+
+Third, because the minimum wage was announced in advance, some employers may have adjusted wages even before May 2011, potentially attenuating the observed before-after difference.
+
+Finally, the use of midpoint approximations for earnings bands and setting the weeks of each month to be 4.345 introduces some measurement error in hourly wage estimates, yes remember:
+
+(hours_main_employment or hours_7days) * 4.345 is monthly working hour
+
+Then we are doing monthly MIDPOINT EARNINGS / monthly working hour to get the estimated hourly wage, then this
+
+
+# Sidenote
+
+Statistical significance is irrelevant. The question is whether the magnitude of the change is economically meaningful — and a drop from 23.5% to 12.9% clearly is.
+
+This is actually more rigorous than tacking on p-values. Many economists (especially in labor economics) argue that with large administrative or survey data, significance testing is misleading because everything is significant.
+
+
+
+# Robustness check (discarded)
+
+## 1. Sample Composition Check (Addresses "Did low-skill workers disappear?")
+
+```{r}
+# Check if sample size changed for vulnerable groups
+sample_check <- df_focus %>%
+  filter(educ_group %in% c("No Schooling / Primary", "Lower Secondary"),
+         year %in% c(2008:2012)) %>%
+  group_by(year, educ_group) %>%
+  summarise(
+    weighted_n = sum(weight, na.rm = TRUE),
+    raw_n = n(),
+    .groups = "drop"
+  )
+
+print(sample_check)
+```
+
+Weighted N for No Schooling/Primary: 1.46M (2008) → 1.30M (2011) = -11% decline
+
+Weighted N for Lower Secondary: 2.00M → 1.89M = -5.5% decline
+
+Some low-skill workers left the sample (possible)
+
+But decline is modest (not massive)
+
+Could explain part of the proportion drop (Possible)
+
+But not all — drop was 10+ percentage points
+
+
+
+What to look for: If weighted_n drops sharply in 2011-2012, composition bias is possible. If it's stable, you can argue against it.
+
+
+
+## 2. Upper Bound Robustness Test (Addresses measurement error)
+
+
+```{r}
+# Test a threshold that shouldn't be affected by minimum wage
+threshold_check <- df_focus %>%
+  filter(year >= 2008, year <= 2012) %>%
+  group_by(year) %>%
+  summarise(
+    below_28 = weighted.mean(real_hourly_wage < 28, w = weight),
+    below_80 = weighted.mean(real_hourly_wage < 80, w = weight),  # Robustness threshold
+    .groups = "drop"
+  )
+
+print(threshold_check)
+
+# If below_80 also dropped sharply in 2011, it's broad economic trend, not policy
+```
+
+Below $28: 8.77% → 5.93% = -2.84pp drop
+
+Below $80: 63.5% → 63.4% = essentially flat (then drops to 59.6% in 2012)
+
+
+
+
+## 3. High-Education Control Group (Addresses "was it just the economy?")
+
+```{r}
+# Compare low vs high education
+control_check <- df_focus %>%
+  filter(year %in% c(2008:2012),
+         educ_broad %in% c("Lower Education", "Tertiary (Degree)")) %>%
+  group_by(year, educ_broad) %>%
+  summarise(
+    below_28 = weighted.mean(real_hourly_wage < 28, w = weight) * 100,
+    .groups = "drop"
+  )
+
+print(control_check)
+
+# If both groups dropped similarly → macroeconomic trend
+# If only low-education dropped → policy effect (but your Robustness says otherwise)
+```
+
+## Sample Composition Bias (Did low-skill workers disappear?)
+第一点，就业那个点，我觉得很有必要验证一下
+```{r}
+# Check employment/population ratio for low-education groups over time
+employment_check <- df_focus %>%
+  filter(educ_group %in% c("No Schooling / Primary", "Lower Secondary"),
+         year >= 2005, year <= 2012) %>%
+  group_by(year, educ_group) %>%
+  summarise(
+    weighted_count = sum(weight, na.rm = TRUE),  # Estimated employed population
+    sample_n = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(educ_group) %>%
+  mutate(
+    index_2008 = weighted_count / weighted_count[year == 2008] * 100  # 2008 = 100
+  )
+
+print(employment_check)
+
+# Also check if this tracks with official HK employment statistics
+# You can cite: C&SD Table 210-06101 (Employment by industry)
+```
+
+Key observations:
+
+No Schooling/Primary dropped ~10-13% from 2008 -> Some composition change occurred
+
+But most of the drop happened BEFORE 2011 (2008→2010: -13.5%) -> Not a 2011-specific phenomenon
+
+2010→2011: 86.5 → 89.3 (actually increased slightly) -> No evidence of mass layoffs in 2011
+
+Lower Secondary remained stable throughout (95-100) -> No composition bias for this group
+以 2008 年为基准（=100），观察 2005-2012 年间样本人数是否发生明显变化。
+
+「你看到的低薪比例下降，是因为雇主给低教育工人涨了工资，还是因为雇主直接把低效工人解雇了，导致他们在样本中消失了？」
+
+结果显示了什么？
+
+no schooling/primary 2008 to 2010 -> -13.5%, 2008 to 2011 -> -10.7%, 2011 年人数并未大幅下降，反而比 2010 年略回升
+
+lower secondary, 2008 to 2010 -> -4.9%, 2008 to 2011 -> -5.5%, 人数基本稳定
+
+人数下降主要发生在 2008-2010 年（最低工资实施之前）
+
+2010→2011 年，低教育组人数没有继续下降（反而略有回升）
+
+低薪比例下降幅度（-10.6 个百分点）远远大于样本人数下降幅度（-11%）
+
+「样本构成变化不足以解释低薪比例的下降。而且人数下降主要发生在政策之前，政策实施后人数反而趋稳，说明下降主要来自‘同组内工资改善’，而非‘低薪工人被踢出样本』。」
+
+```{r}
+# Create the composition trend plot with data labels
+employment_check %>%
+  ggplot(aes(x = year, y = index_2008, color = educ_group, shape = educ_group)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = round(index_2008, 1)), 
+            vjust = -0.8, 
+            size = 3, 
+            show.legend = FALSE) +
+  geom_hline(yintercept = 100, linetype = "dashed", alpha = 0.5) +
+  geom_vline(xintercept = 2011, linetype = "dotted", color = "red", alpha = 0.7) +
+  annotate("text", x = 2011, y = 105, label = "SMW Implemented", 
+           color = "red", size = 3.5, hjust = -0.1) +
+  scale_x_continuous(breaks = seq(2005, 2012, 1)) +
+  scale_y_continuous(limits = c(80, 110),
+                     breaks = seq(80, 110, 5)) +
+  labs(title = "Sample Composition of Low-Education Groups (2008 = 100)",
+       subtitle = "Weighted employment counts indexed to 2008 baseline",
+       x = "Year", 
+       y = "Index (2008 = 100)",
+       color = "Education Group",
+       shape = "Education Group") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+
+```{r}
+employment_check %>%
+  mutate(year = as.factor(year)) %>%
+  ggplot(aes(x = year, y = index_2008, fill = educ_group)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.7) +
+  geom_text(aes(label = round(index_2008, 1)), 
+            position = position_dodge(width = 0.7), 
+            vjust = -0.5, 
+            size = 3) +
+  geom_hline(yintercept = 100, linetype = "dashed") +
+  labs(title = "Sample Composition of Low-Education Groups (2008 = 100)",
+       subtitle = "Weighted employment counts indexed to 2008 baseline",
+       x = "Year", 
+       y = "Index (2008 = 100)",
+       fill = "Education Group") +
+  scale_fill_manual(values = c("Lower Secondary" = "steelblue", 
+                                "No Schooling / Primary" = "darkred")) +
+  scale_y_continuous(limits = c(0, 120)) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Midpoint Error (Upper/Lower Bound Test)
+```{r}
+# Define upper and lower bounds for each earnings code
+# Using your existing earnings_map structure
+
+# Lower bound (use the lower end of each earnings band)
+lower_bound_map <- tibble(
+  code = str_pad(1:40, width = 2, pad = "0"),
+  lower_hkd = c(0, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,
+                11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000,
+                22000, 24000, 26000, 28000, 30000, 32000, 34000, 36000, 38000, 40000,
+                42000, 44000, 46000, 48000, 50000, 60000, 70000, 80000, 90000, 100000)
+)
+
+# Upper bound (use the upper end of each earnings band)
+upper_bound_map <- tibble(
+  code = str_pad(1:40, width = 2, pad = "0"),
+  upper_hkd = c(1999, 2999, 3999, 4999, 5999, 6999, 7999, 8999, 9999, 10999,
+                11999, 12999, 13999, 14999, 15999, 16999, 17999, 18999, 19999, 21999,
+                23999, 25999, 27999, 29999, 31999, 33999, 35999, 37999, 39999, 41999,
+                43999, 45999, 47999, 49999, 54999, 64999, 74999, 84999, 94999, 149999)
+)
+
+# Calculate hourly wages using upper and lower bounds
+df_sensitivity <- df_focus %>%
+  mutate(
+    # Lower bound hourly wage
+    earnings_main_lower = lower_bound_map$lower_hkd[match(earnings_main, lower_bound_map$code)],
+    hourly_wage_lower = earnings_main_lower / (hours_main_employment * 4.345),
+    
+    # Upper bound hourly wage
+    earnings_main_upper = upper_bound_map$upper_hkd[match(earnings_main, upper_bound_map$code)],
+    hourly_wage_upper = earnings_main_upper / (hours_main_employment * 4.345),
+    
+    # Midpoint (your original)
+    earnings_main_mid = earnings_map$midpoint_hkd[match(earnings_main, earnings_map$code)],
+    hourly_wage_mid = earnings_main_mid / (hours_main_employment * 4.345)
+  )
+
+# Compare results across three methods for No Schooling group
+sensitivity_results <- df_sensitivity %>%
+  filter(educ_group == "No Schooling / Primary", year %in% c(2008:2012)) %>%
+  group_by(year) %>%
+  summarise(
+    midpoint = weighted.mean(hourly_wage_mid < 28, w = weight, na.rm = TRUE) * 100,
+    lower_bound = weighted.mean(hourly_wage_lower < 28, w = weight, na.rm = TRUE) * 100,
+    upper_bound = weighted.mean(hourly_wage_upper < 28, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(sensitivity_results)
+```
+
+用三种不同的方法重新计算每小时工资，然后重新估算「无 schooling/小学」组中低于 HK$28 的比例：
+
+中点值（Midpoint）,	原来用的方法（取月薪区间的中间值）
+下限（Lower Bound), 取月薪区间的最低值（例如 code 01 = HK$0）
+上限（Upper Bound）,	取月薪区间的最高值（例如 code 01 = HK$1,999）
+
+「你的时薪是根据月薪层级中点值和 4.345 倍率算出来的，这本身带有巨大的测量误差。」
+
+结果显示了什么？
+
+
+关键发现：
+
+    三种方法都显示 2010→2011 年出现大幅下降
+
+    中点值：28.6% → 17.9%（-10.7 个百分点）
+
+    下限：34.2% → 24.0%（-10.2 个百分点）
+
+    上限：19.5% → 10.6%（-8.9 个百分点）
+
+    中点和下限的下降幅度几乎相同，上限略小但方向一致
+
+
+「无论我们假设月薪是区间的最低值、中间值还是最高值，2011 年的低薪比例都出现了显著下降。结论不依赖于中点值的选择，结果是稳健的。」
+
+
+
+
+
+```{r}
+# Prepare data for plotting
+sensitivity_plot_data <- sensitivity_results %>%
+  pivot_longer(cols = c(midpoint, lower_bound, upper_bound),
+               names_to = "method",
+               values_to = "proportion") %>%
+  mutate(method = factor(method, 
+                         levels = c("upper_bound", "midpoint", "lower_bound"),
+                         labels = c("Upper Bound", "Midpoint", "Lower Bound")))
+
+# Create the plot with data labels
+ggplot(sensitivity_plot_data, aes(x = year, y = proportion, color = method, shape = method)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = round(proportion, 1)), 
+            vjust = -0.8, 
+            size = 3.5, 
+            show.legend = FALSE) +
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", alpha = 0.7) +
+  annotate("text", x = 2011, y = 42, label = "SMW Implemented", 
+           color = "red", size = 4, hjust = -0.1) +
+  scale_x_continuous(breaks = seq(2008, 2012, 1)) +
+  scale_y_continuous(limits = c(0, 45),
+                     breaks = seq(0, 45, 5)) +
+  labs(title = "Sensitivity Test: Proportion Below HK$28 by Earnings Assumption",
+       subtitle = "No Schooling / Primary Workers | Three methods of calculating hourly wage",
+       x = "Year", 
+       y = "Proportion Below HK$28 (%)",
+       color = "Assumption",
+       shape = "Assumption") +
+  scale_color_manual(values = c("Lower Bound" = "darkred",
+                                 "Midpoint" = "steelblue",
+                                 "Upper Bound" = "darkgreen")) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 11),
+        legend.text = element_text(size = 10))
+```
+
+
+
+
+
+
+
+
+All three methods show a large decline in 2011 => Results are NOT sensitive to midpoint choice
+
+Midpoint: 28.6% → 17.9% (-10.7pp) => main result
+
+Lower bound: 34.2% → 24.0% (-10.2pp) => Similar magnitude 
+
+Upper bound: 19.5% → 10.6% (-8.9pp) => Slightly smaller but still large
+
+The spread between bounds narrowed in 2011-2012 => Suggests less measurement error at lower wages
+
+```{r}
+# ============================================================
+# STEP 1: Create age_group in df_focus (if not already there)
+# ============================================================
+
+df_focus <- df_focus %>%
+  mutate(
+    age_num = as.numeric(age),
+    age_group = case_when(
+      age_num %in% 4:6   ~ "15-29 (Young)",
+      age_num %in% 7:10  ~ "30-49 (Prime-age)",
+      age_num %in% 11:14 ~ "50+ (Older)",
+      TRUE               ~ "Unknown"
+    )
+  )
+
+# ============================================================
+# STEP 2: Calculate Education Group Composition
+# ============================================================
+
+edu_composition <- df_focus %>%
+  filter(educ_group %in% c("No Schooling / Primary", "Lower Secondary"),
+         year >= 2005, year <= 2012) %>%
+  group_by(year, educ_group) %>%
+  summarise(
+    weighted_count = sum(weight, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(educ_group) %>%
+  mutate(
+    index_2008 = weighted_count / weighted_count[year == 2008] * 100,
+    group_type = "Education Group"
+  ) %>%
+  rename(subgroup = educ_group) %>%
+  select(year, subgroup, index_2008, group_type)
+
+# ============================================================
+# STEP 3: Calculate Age Group Composition
+# ============================================================
+
+age_composition <- df_focus %>%
+  filter(age_group %in% c("15-29 (Young)", "50+ (Older)"),
+         year >= 2005, year <= 2012) %>%
+  group_by(year, age_group) %>%
+  summarise(
+    weighted_count = sum(weight, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Get 2008 baseline for age groups
+baseline_2008_age <- age_composition %>%
+  filter(year == 2008) %>%
+  select(age_group, base_2008 = weighted_count)
+
+# Calculate index
+age_composition <- age_composition %>%
+  left_join(baseline_2008_age, by = "age_group") %>%
+  mutate(
+    index_2008 = weighted_count / base_2008 * 100,
+    group_type = "Age Group"
+  ) %>%
+  rename(subgroup = age_group) %>%
+  select(year, subgroup, index_2008, group_type)
+
+# ============================================================
+# STEP 4: Combine Both Datasets
+# ============================================================
+
+composition_combined <- bind_rows(edu_composition, age_composition)
+
+# ============================================================
+# STEP 5: Check 50+ data is complete
+# ============================================================
+
+composition_combined %>% filter(subgroup == "50+ (Older)")
+
+# ============================================================
+# STEP 6: Create the Plot
+# ============================================================
+
+library(ggrepel)  # Optional: for better label placement
+
+ggplot(composition_combined, aes(x = year, y = index_2008, 
+                                  color = subgroup, shape = subgroup)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = round(index_2008, 0)), 
+                  size = 3.0,
+                  box.padding = 0.3,
+                  point.padding = 0.5,
+                  segment.color = NA,
+                  show.legend = FALSE) +
+  geom_hline(yintercept = 100, linetype = "dashed", alpha = 0.5) +
+  geom_vline(xintercept = 2011, linetype = "dotted", color = "red", linewidth = 0.8) +
+  annotate("text", x = 2011, y = 135, label = "SMW Implemented (May 2011)", 
+           color = "red", size = 3.5, hjust = -0.05) +
+  scale_x_continuous(breaks = seq(2005, 2012, 1)) +
+  scale_y_continuous(limits = c(70, 140),
+                     breaks = seq(70, 140, 10)) +
+  labs(title = "Sample Composition of Vulnerable Groups (2008 = 100)",
+       subtitle = "Weighted employment counts indexed to 2008 baseline",
+       x = "Year", 
+       y = "Index (2008 = 100)",
+       color = "Subgroup",
+       shape = "Subgroup") +
+  scale_color_manual(values = c("Lower Secondary" = "steelblue",
+                                 "No Schooling / Primary" = "darkred",
+                                 "15-29 (Young)" = "forestgreen",
+                                 "50+ (Older)" = "purple")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 9),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+No Schooling / Primary = 下降在政策前
+
+Lower Secondary = 基本稳定
+
+15-29 (Young) = 先降后升，2012回到原点
+
+50+ (Older) = 大幅增长
+
+教授的质疑是：「你看到的低薪比例下降，是因为低薪工人涨了工资，还是因为他们被解雇了，从样本里消失了？」
+
+低教育组的人数确实减少了（约 10%）
+
+但减少主要发生在 2008-2010 年（政策前），2011 年后就稳定了
+
+老年人的人数不但没减少，反而增加了 17-30%
+
+「低薪工人被解雇了」? 低教育组人数减少，但发生在政策前 -> 所以不能用「政策导致人消失」来解释低薪比例的下降
+
+「2011 年人数暴跌」? 2011 年后人数稳定，没有继续跌 -> 政策没有导致「被踢出去」
+
+「老年工人也被解雇了」? 老年人人数增长了 30% -> 恰恰相反，更多老年人留在/进入劳动力市场
+
+
+主要发现是：2011 年后低薪比例大幅下降。
+
+因此：「人被踢出去了」这个替代解释被排除。你的主要发现（低薪比例下降）更可能来自工资上涨，而不是样本流失。
+
+
+```{r fig.width=10, fig.height=10, out.width="100%"}
+# ============================================================
+# 修复后的图：使用 ggrepel 避免标签重叠
+# ============================================================
+
+library(ggrepel)
+
+# 合并数据（确保使用最新的 age_composition）
+composition_combined <- bind_rows(edu_composition, age_composition)
+
+# 画图（使用 geom_text_repel 代替 geom_text）
+ggplot(composition_combined, aes(x = year, y = index_2008, 
+                                  color = subgroup, shape = subgroup)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  # 关键修改：用 geom_text_repel 替代 geom_text
+  geom_text_repel(aes(label = round(index_2008, 0)), 
+                  size = 3.0,
+                  box.padding = 0.3,
+                  point.padding = 0.5,
+                  segment.color = NA,  # 不画连线（可选）
+                  show.legend = FALSE) +
+  geom_hline(yintercept = 100, linetype = "dashed", alpha = 0.5) +
+  geom_vline(xintercept = 2011, linetype = "dotted", color = "red", linewidth = 0.8) +
+  annotate("text", x = 2011, y = 135, label = "SMW Implemented \n(May 2011)", 
+           color = "red", size = 3.5, hjust = -0.05) +
+  scale_x_continuous(breaks = seq(2005, 2012, 1)) +
+  scale_y_continuous(limits = c(70, 140),
+                     breaks = seq(70, 140, 10)) +
+  labs(title = "Sample Composition of Vulnerable Groups (2008 = 100)",
+       subtitle = "Weighted employment counts indexed to 2008 baseline",
+       x = "Year", 
+       y = "Index (2008 = 100)",
+       color = "Subgroup",
+       shape = "Subgroup") +
+  scale_color_manual(values = c("Lower Secondary" = "steelblue",
+                                 "No Schooling / Primary" = "darkred",
+                                 "15-29 (Young)" = "forestgreen",
+                                 "50+ (Older)" = "purple")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 9),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+
+
+
+
+
+```{r}
+# ============================================================
+# Sensitivity Test for Age Group (50+ Older Workers)
+# Compare midpoint, lower bound, and upper bound estimates
+# ============================================================
+
+# Calculate hourly wages using upper and lower bounds (if not already done)
+df_sensitivity <- df_focus %>%
+  mutate(
+    # Lower bound hourly wage
+    earnings_main_lower = lower_bound_map$lower_hkd[match(earnings_main, lower_bound_map$code)],
+    hourly_wage_lower = earnings_main_lower / (hours_main_employment * 4.345),
+    
+    # Upper bound hourly wage
+    earnings_main_upper = upper_bound_map$upper_hkd[match(earnings_main, upper_bound_map$code)],
+    hourly_wage_upper = earnings_main_upper / (hours_main_employment * 4.345),
+    
+    # Midpoint (your original)
+    earnings_main_mid = earnings_map$midpoint_hkd[match(earnings_main, earnings_map$code)],
+    hourly_wage_mid = earnings_main_mid / (hours_main_employment * 4.345)
+  )
+
+# Compare results across three methods for 50+ Older workers
+sensitivity_results_age <- df_sensitivity %>%
+  filter(age_group == "50+ (Older)", year %in% c(2008:2012)) %>%
+  group_by(year) %>%
+  summarise(
+    midpoint = weighted.mean(hourly_wage_mid < 28, w = weight, na.rm = TRUE) * 100,
+    lower_bound = weighted.mean(hourly_wage_lower < 28, w = weight, na.rm = TRUE) * 100,
+    upper_bound = weighted.mean(hourly_wage_upper < 28, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(sensitivity_results_age)
+
+# Prepare data for plotting
+sensitivity_plot_data_age <- sensitivity_results_age %>%
+  pivot_longer(cols = c(midpoint, lower_bound, upper_bound),
+               names_to = "method",
+               values_to = "proportion") %>%
+  mutate(method = factor(method, 
+                         levels = c("upper_bound", "midpoint", "lower_bound"),
+                         labels = c("Upper Bound", "Midpoint", "Lower Bound")))
+
+# Create the plot with data labels
+ggplot(sensitivity_plot_data_age, aes(x = year, y = proportion, color = method, shape = method)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = round(proportion, 1)), 
+            vjust = -0.8, 
+            size = 3.5, 
+            show.legend = FALSE) +
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", alpha = 0.7) +
+  annotate("text", x = 2011, y = 35, label = "SMW Implemented", 
+           color = "red", size = 4, hjust = -0.1) +
+  scale_x_continuous(breaks = seq(2008, 2012, 1)) +
+  scale_y_continuous(limits = c(0, 45),
+                     breaks = seq(0, 45, 5)) +
+  labs(title = "Sensitivity Test: Proportion Below HK$28 by Earnings Assumption",
+       subtitle = "Older Workers (50+) | Three methods of calculating hourly wage",
+       x = "Year", 
+       y = "Proportion Below HK$28 (%)",
+       color = "Assumption",
+       shape = "Assumption") +
+  scale_color_manual(values = c("Lower Bound" = "darkred",
+                                 "Midpoint" = "steelblue",
+                                 "Upper Bound" = "darkgreen")) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 11),
+        legend.text = element_text(size = 10))
+
+
+```
+
+
+
+```{r}
+# Threshold test for HK$23, HK$28, HK$33
+threshold_test <- df_focus %>%
+  filter(educ_group == "No Schooling / Primary", year %in% seq(2000, 2012)) %>%
+  group_by(year) %>%
+  summarise(
+    below_23 = weighted.mean(real_hourly_wage < 23, w = weight, na.rm = TRUE) * 100,
+    below_28 = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    below_33 = weighted.mean(real_hourly_wage < 33, w = weight, na.rm = TRUE) * 100
+  )
+
+print(threshold_test)
+
+# Prepare data for plotting
+threshold_plot_data <- threshold_test %>%
+  pivot_longer(cols = c(below_23, below_28, below_33),
+               names_to = "threshold",
+               values_to = "proportion") %>%
+  mutate(threshold = factor(threshold,
+                            levels = c("below_23", "below_28", "below_33"),
+                            labels = c("Below HK$23", "Below HK$28", "Below HK$33")))
+
+# Create the plot
+ggplot(threshold_plot_data, aes(x = year, y = proportion, color = threshold, shape = threshold)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  geom_text(aes(label = round(proportion, 1)),
+            vjust = -0.8,
+            size = 3,
+            show.legend = FALSE) +
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", alpha = 0.7) +
+  annotate("text", x = 2011, y = 35, label = "SMW",
+           color = "red", size = 3.5, hjust = -0.05) +
+  scale_x_continuous(breaks = seq(2000, 2012, 2)) +
+  #scale_y_continuous(limits = c(0, 35),                     breaks = seq(0, 35, 5)) +
+  labs(title = "Proportion Below Different Thresholds (HK$23, HK$28, HK$33)",
+       subtitle = "No Schooling / Primary Workers | Real wages adjusted to 2011 Q2 prices",
+       x = "Year",
+       y = "Proportion (%)",
+       color = "Threshold",
+       shape = "Threshold") +
+  scale_color_manual(values = c("Below HK$33" = "darkgreen",
+                                 "Below HK$28" = "steelblue",
+                                 "Below HK$23" = "darkred")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 11),
+        legend.text = element_text(size = 10))
+
+```
+
+
+
+
+
+
+
+
+
+

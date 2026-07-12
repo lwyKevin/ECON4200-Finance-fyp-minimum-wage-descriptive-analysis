@@ -1,0 +1,1333 @@
+---
+title: "ECON4200 - Hong Kong Statutory Minimum Wage Analysis - Age Group"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    fig_crop: false
+
+header-includes:
+  - \usepackage[table]{xcolor}
+  - \usepackage{booktabs}
+  - \usepackage{caption}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{colortbl}
+
+date: "2026-04-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  dev = "cairo_pdf",
+  out.width = "100%",
+  cache = FALSE,
+  fig.path = "figs/"
+)
+options(scipen = 999)
+```
+
+
+
+# setting up again
+## Load Libraries & Define Mappings
+load lib
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ggridges)
+library(Hmisc)
+library(kableExtra)
+library(knitr)
+```
+done load lib
+
+
+
+load earning map
+```{r, echo=TRUE}
+earnings_map <- tibble(
+  code = str_pad(1:40, width = 2, pad = "0"),
+  midpoint_hkd = c(1000,2500,3500,4500,5500,6500,7500,8500,9500,
+                   10500,11500,12500,13500,14500,15500,16500,17500,
+                   18500,19500,21000,23000,25000,27000,29000,31000,
+                   33000,35000,37000,39000,41000,43000,45000,47000,
+                   49000,55000,65000,75000,85000,95000,120000)
+)
+
+other_earnings_map <- tibble(
+  code = str_pad(1:11, width = 2, pad = "0"),
+  midpoint_hkd = c(500,1500,2500,3500,4500,5500,6500,7500,8500,9500,12000)
+)
+```
+done load earning map
+
+
+## Data Loading & Processing
+Load all files + calculate est hourly wage
+same method used
+```{r}
+files <- list.files("data_csv", pattern = "*.csv", full.names = TRUE)
+df_raw <- files %>% map_df(~read_csv(.x, col_types = cols(.default = "c")))
+
+df <- df_raw %>%
+  mutate(
+    year_quarter = str_trim(as.character(year_quarter)),
+    year = as.integer(str_sub(year_quarter, 1, 4)),
+    quarter = as.integer(str_sub(year_quarter, 5, 5)),
+    date = yq(paste0(year, "-Q", quarter)),
+    
+    across(c(earnings_main, earnings_employed, earnings_other),
+           ~ str_pad(as.character(.), width = 2, pad = "0", side = "left")),
+    
+    earnings_main_hkd     = earnings_map$midpoint_hkd[match(earnings_main, earnings_map$code)],
+    earnings_employed_hkd = earnings_map$midpoint_hkd[match(earnings_employed, earnings_map$code)],
+    earnings_other_hkd    = other_earnings_map$midpoint_hkd[match(earnings_other, other_earnings_map$code)],
+    
+    across(c(hours_main_employment, hours_7days),
+           ~ case_when(.x %in% c("999","99","","NA") ~ NA_real_, TRUE ~ as.numeric(.x))),
+    
+    hourly_wage = case_when(
+      !is.na(earnings_main_hkd) & !is.na(hours_main_employment) & hours_main_employment > 0 ~
+        earnings_main_hkd / (hours_main_employment * 4.345),
+      !is.na(earnings_employed_hkd) & !is.na(hours_7days) & hours_7days > 0 ~
+        earnings_employed_hkd / (hours_7days * 4.345),
+      TRUE ~ NA_real_
+    ),
+    
+    is_employed       = economic_status %in% c("1","2","3"),
+    working_age       = age %in% str_pad(4:13, 2, pad = "0"),
+    not_foreign_helper = foreign_helper != "1" | is.na(foreign_helper),
+    not_underemployed  = underemployed != "1",
+    weight = as.numeric(grossing_up_factor) / 1e12
+  ) %>%
+  filter(!is.na(date), year >= 1985)
+
+
+```
+done
+
+ranges mapping
+```{r}
+df_focus <- df %>%
+  filter(is_employed, working_age, not_foreign_helper, not_underemployed,
+         !is.na(hourly_wage), hourly_wage > 0,
+         hours_main_employment >= 8 | is.na(hours_main_employment)) %>%
+  mutate(
+    year_group = case_when(
+      year <= 1989 ~ "1985-1989",
+      year >= 1990 & year <= 1994 ~ "1990-1994",
+      year >= 1995 & year <= 1999 ~ "1995-1999",
+      year >= 2000 & year <= 2004 ~ "2000-2004",
+      year >= 2005 & year <= 2009 ~ "2005-2009",
+      year >= 2010 & year <= 2012 ~ "2010-2012",
+      TRUE ~ "Other"
+    )
+  )
+```
+done
+
+
+
+## CPI Processing (Real Wages)
+```{r}
+raw_cpi <- read_csv("Table 510-60001_en.csv", skip = 4)
+
+cleaned_cpi <- raw_cpi %>%
+  rename(Year = 1, Month = 2, Comp_Index = 3, CPIA_Index = 6) %>%
+  fill(Year) %>%
+  filter(!is.na(Month)) %>%
+  mutate(Year = as.numeric(Year)) %>% 
+  mutate(across(c(Comp_Index, CPIA_Index), as.numeric)) %>%
+  filter(Year >= 1985 & Year <= 2012)
+
+cpi_quarterly <- cleaned_cpi %>%
+  mutate(quarter = case_when(
+    Month %in% c("Jan", "Feb", "Mar") ~ 1,
+    Month %in% c("Apr", "May", "Jun") ~ 2,
+    Month %in% c("Jul", "Aug", "Sep") ~ 3,
+    Month %in% c("Oct", "Nov", "Dec") ~ 4
+  )) %>%
+  dplyr::group_by(Year, quarter) %>%
+  dplyr::summarise(
+    cpi_comp = mean(Comp_Index, na.rm = TRUE),
+    cpi_a = mean(CPIA_Index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ref_cpi <- cpi_quarterly %>%
+  filter(Year == 2011, quarter == 2) %>%
+  pull(cpi_comp)
+
+print(paste("2011 Q2 Reference CPI Value is:", ref_cpi))
+```
+done
+
+## Add Real Wage to Main Dataset
+```{r}
+df_focus <- df_focus %>%
+  left_join(cpi_quarterly, by = c("year" = "Year", "quarter" = "quarter")) %>%
+  mutate(real_hourly_wage = (hourly_wage / cpi_comp) * ref_cpi)
+```
+done adding real wage
+
+## Testing to reconfirm is same as previous rmd file
+```{r data-validation}
+cat("=== Basic Data Overview ===\n")
+cat("Total rows in raw data:", nrow(df_raw), "\n")
+cat("Total rows after processing:", nrow(df), "\n")
+cat("Rows in focus sample:", nrow(df_focus), "\n\n")
+
+cat("Years covered:\n")
+print(df_focus %>% count(year, quarter) %>% arrange(year, quarter))
+
+cat("\n=== Key Variable Summary ===\n")
+summary(df_focus %>% select(hourly_wage, real_hourly_wage, weight, 
+                            hours_main_employment, earnings_main_hkd))
+
+cat("\n=== Missing Values (%) ===\n")
+df_focus %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_%") %>%
+  filter(`Missing_%` > 0) %>%
+  arrange(desc(`Missing_%`)) %>%
+  print()
+
+cat("\n=== Hourly Wage Distribution (Nominal) ===\n")
+df_focus %>%
+  summarise(
+    Min = min(hourly_wage, na.rm = TRUE),
+    P5 = quantile(hourly_wage, 0.05, na.rm = TRUE),
+    Median = median(hourly_wage, na.rm = TRUE),
+    Mean = mean(hourly_wage, na.rm = TRUE),
+    P95 = quantile(hourly_wage, 0.95, na.rm = TRUE),
+    Max = max(hourly_wage, na.rm = TRUE),
+    N = n()
+  ) %>% 
+  kable(digits = 2)
+```
+
+### 1. Check Earnings Mapping
+```{r check-earnings-mapping}
+cat("Unique earnings_main codes and their mapped values:\n")
+df_focus %>%
+  count(earnings_main, earnings_main_hkd) %>%
+  arrange(earnings_main) %>%
+  print(n = 30)
+```
+
+### 2. Check Weighting Factor
+```{r check-weights}
+cat("Total weighted population (should be around Hong Kong's employed population):\n")
+sum(df_focus$weight, na.rm = TRUE) %>% round(3)
+```
+
+
+### 3. Sample of Raw vs Processed Data
+yea this one isnt going to be same but uh it exist
+```{r sample-data}
+df_focus %>%
+  select(year, quarter, earnings_main, earnings_main_hkd, 
+         hours_main_employment, hourly_wage, real_hourly_wage) %>%
+  slice_sample(n = 10) %>%
+  kable(digits = 2)
+```
+
+
+
+Now actual content
+
+Cont.
+The aggregate data shows a continued improvement in wages and a reduction in the low-wage share around 2011, the effect appears modest in the overall population. This raises the question of whether the minimum wage had a stronger impact on specific vulnerable groups.
+Therefore, the next step is to conduct a more disaggregated analysis by examining subgroups such as:
+
+Younger workers (e.g., aged 15–29) & prime workers maybe
+
+# Age grouping
+
+Age code:
+Code Description
+01 < 5
+02 5 – 9
+03 10 – 14
+04 15 – 19
+05 20 – 24
+06 25 – 29
+07 30 – 34
+08 35 – 39
+09 40 – 44
+10 45 – 49
+11 50 – 54
+12 55 – 59
+13 60 – 64
+14 > 65
+
+
+We decided to split it as 
+
+15-29 vs 30-49 vs 50-64
+
+15-29 captures the critical transition period (students, fresh graduates, early career)
+
+30-49 serves as a strong control group — they are less likely to be affected by the minimum wage
+
+50-64 allows us to see whether older low-skilled workers also benefited (important in Hong Kong context with an aging population)
+
+
+We group them separately:
+```{r}
+## === AGE GROUP ANALYSIS ===
+
+df_focus <- df_focus %>%
+  mutate(
+    age_num = as.numeric(age),
+    
+    age_group = case_when(
+      age_num %in% 4:6                  ~ "15-29 (Young)",      # 15-19, 20-24, 25-29
+      age_num %in% 7:10                 ~ "30-49 (Prime-age)",  # 30-34 ... 45-49
+      age_num %in% 11:13                ~ "50-64 (Older)",        # 50-54 ... 65+
+      TRUE                              ~ "Unknown"
+    )
+  )
+```
+grouping done yes i didnt set echo=true here so you cannot see the codes, i dont head(df_focus) cuz there are like 40+ variables or sth it is going to be a long printing.
+
+
+Here's the % occupied for each age group:
+```{r}
+df_focus %>%
+  filter(!is.na(age_group)) %>%
+  count(age_group) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+```
+
+
+# 1. Long-term Trend (Proportion Below $28 by Age Group)
+```{r  fig.width=7, fig.height=7, out.width="100%"}
+# 1. Long-term Trend (Proportion Below $28 by Age Group)
+# Re-create the graph using the same data source as your table
+
+prop_age_corrected <- df_focus %>%
+  filter(age_group != "Unknown") %>%
+  group_by(year, age_group) %>%
+  summarise(
+    below_28 = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(year >= 2002)
+
+# Print to verify values match your table
+prop_age_corrected %>% 
+  filter(age_group == "50-64 (Older)", year %in% c(2008, 2010, 2012))
+
+# Plot using prop_age_corrected (NOT prop_age)
+ggplot(prop_age_corrected, aes(x = year, y = below_28, color = age_group)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +  
+  geom_text(aes(label = round(below_28, 1)), 
+            vjust = -0.8, size = 3.5, show.legend = FALSE) +
+  scale_x_continuous(breaks = seq(2002, 2012, by = 2)) +
+  labs(title = "Proportion Earning Below Real HK$28 by Age Group",
+       subtitle = "Real wages in 2011 prices",
+       x = "Year", y = "Proportion (%)") +
+  
+geom_vline(xintercept = 2011, linetype = "dashed", color = "red", linewidth = 0.8) +
+annotate("text", x = 2011, y = Inf, label = "SMW", color = "red", size = 4, hjust = -0.2, vjust = 1.5)+
+  
+  
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+```
+
+# YoY % Change Tables by Age Group
+
+2008 to 2012, 2007 is included as yoy% change for 2008 else 2008 % change will be NA
+
+```{r}
+# Improved YoY tables by Age Group
+age_groups <- df_focus %>%
+  filter(age_group != "Unknown") %>%
+  pull(age_group) %>% unique() %>% sort()
+
+for (group in age_groups) {
+  cat("\n##", group, "\n\n")
+  
+  table_data <- df_focus %>%
+    filter(age_group == group, year >= 2007, year <= 2012) %>%
+    group_by(year) %>%
+    summarise(
+      `Below $28` = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+      `Below $35` = round(weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100, 1),
+      `Below $40` = round(weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100, 1),
+      .groups = "drop"
+    ) %>%
+    arrange(year) %>%
+    mutate(
+      `YoY $28` = round((`Below $28` - lag(`Below $28`)) / lag(`Below $28`) * 100, 1),
+      `YoY $35` = round((`Below $35` - lag(`Below $35`)) / lag(`Below $35`) * 100, 1),
+      `YoY $40` = round((`Below $40` - lag(`Below $40`)) / lag(`Below $40`) * 100, 1)
+    ) %>%
+    filter(year >= 2008)
+  
+  print(kable(table_data,
+              caption = paste("Proportion Below Thresholds & YoY % Change -", group),
+              align = "r"))
+  cat("\n")
+}
+```
+
+
+
+
+
+
+```{r}
+# Debug: Check exact values that should appear in tables
+debug_table <- df_focus %>%
+  filter(age_group != "Unknown",
+         year >= 2007, year <= 2012) %>%
+  group_by(year, age_group) %>%
+  summarise(
+    `Below $28` = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below $35` = weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below $40` = weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(age_group, year)
+
+print(debug_table, n = Inf)
+```
+Key Observations:
+
+Older workers (50-64) have by far the highest proportion earning below HK$28 — both before (13%) and after (6.8%).
+
+Young workers (15-29) improved, but started from a lower base.
+
+Prime-age (30-49) have the lowest incidence of very low wages.
+
+
+Possible reasons:
+
+Older workers (50-64) in Hong Kong:
+Many are in low-paying, low-skill service jobs (cleaning, security, retail, restaurant helpers).
+They often have lower bargaining power, less formal education, and may face age discrimination.
+Some are re-entering the labor market after raising children or due to insufficient retirement savings.
+This group is surprisingly vulnerable in Hong Kong’s labor market.
+
+
+Young workers (15-29):
+Many are still studying or in part-time / training positions.
+Some are in higher-paying entry-level white-collar or service jobs.
+They benefited from the minimum wage, but the baseline was not as bad as for older low-skilled workers.
+
+
+# 2. Before vs After by Age Group (Below $28) - Main Plot
+
+2008Q1 - 2011Q1 vs 2011Q2 - 2012Q4
+```{r}
+# Before vs After - Below $28 by Age Group
+event_age <- df_focus %>%
+  filter(year >= 2008, year <= 2012, age_group != "Unknown") %>%
+  mutate(period = if_else(date < as.Date("2011-05-01"), "Before", "After")) %>%
+  group_by(period, age_group) %>%
+  summarise(
+    below_28 = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+ggplot(event_age, aes(x = age_group, y = below_28, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(below_28, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 5, fontface = "bold") +
+  labs(title = "Below Real HK$28: Before vs After May 2011",
+       subtitle = "By Age Group",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before" = "grey60", "After" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+But then there could be averaging effect like 2008Q1 to 2011Q1 vs 2011Q2 - 2011Q4, so we dont use avg effect BUT we do right before and right after i.e. 2011Q1 vs 2011Q3 directly:
+
+
+```{r}
+## === SHARP BEFORE vs AFTER (2011Q1 vs 2011Q3) - Age Group Only ===
+
+sharp_age <- df_focus %>%
+  filter(age_group != "Unknown",
+         (year == 2011 & quarter == 1) | 
+         (year == 2011 & quarter == 3)) %>%
+  mutate(
+    period = if_else(quarter == 1, 
+                     "Before (2011Q1)", 
+                     "After (2011Q3)")
+  ) %>%
+  group_by(period, age_group) %>%
+  summarise(
+    `Below $28` = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+    `Below $35` = round(weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100, 1),
+    `Below $40` = round(weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+print(sharp_age)   # Check if both periods exist
+```
+
+
+## Below hk 28
+```{r}
+ggplot(sharp_age, aes(x = age_group, y = `Below $28`, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = `Below $28`), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 5, fontface = "bold") +
+  labs(title = "Below Real HK$28: Right Before vs Right After",
+       subtitle = "2011Q1 (Before) vs 2011Q3 (After)",
+       x = "", 
+       y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", 
+                               "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Below hk 35
+```{r}
+ggplot(sharp_age, aes(x = age_group, y = `Below $35`, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = `Below $35`),
+            position = position_dodge(width = 0.75),
+            vjust = -0.4, size = 5, fontface = "bold") +
+  labs(title = "Below Real HK$35: Right Before vs Right After",
+       subtitle = "2011Q1 (Before) vs 2011Q3 (After)",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", 
+                               "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Below hk 40
+```{r}
+ggplot(sharp_age, aes(x = age_group, y = `Below $40`, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = `Below $40`),
+            position = position_dodge(width = 0.75),
+            vjust = -0.4, size = 5, fontface = "bold") +
+  labs(title = "Below Real HK$40: Right Before vs Right After",
+       subtitle = "2011Q1 (Before) vs 2011Q3 (After)",
+       x = "", y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "grey60", 
+                               "After (2011Q3)" = "darkblue")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+# Summary table: Right before vs after by age (Below $28)
+```{r}
+sharp_summary_age <- df_focus %>%
+  filter(age_group != "Unknown",
+         (year == 2011 & quarter == 1) | 
+         (year == 2011 & quarter == 3)) %>%
+  mutate(period = if_else(quarter == 1, "Before (2011Q1)", "After (2011Q3)")) %>%
+  group_by(age_group, period) %>%
+  summarise(
+    `Below $28 (%)` = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = period, values_from = `Below $28 (%)`) %>%
+  mutate(
+    `Change (pp)` = round(`After (2011Q3)` - `Before (2011Q1)`, 1),
+    `Relative Change (%)` = round((`After (2011Q3)` - `Before (2011Q1)`) / `Before (2011Q1)` * 100, 1)
+  ) %>%
+  arrange(`Change (pp)`)  # Largest drop first
+
+# Display nice table
+kable(sharp_summary_age, 
+      caption = "Right Before vs Right After: Proportion Below Real HK dollar 28 by Age Group (2011Q1 vs 2011Q3)",
+      digits = 1,
+      align = "lrrrr") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE)
+```
+
+Key Findings from Age Group Analysis:
+
+Older workers (50-64) had the highest incidence of low wages both before and after the minimum wage. The proportion earning below HK$28 dropped significantly from 12.6% (2011Q1) to 7.0% (2011Q3).
+Young workers (15-29) also benefited, with a reduction from 6.0% to 4.3%.
+Prime-age workers (30-49) had the lowest share of very low wages and showed a moderate improvement.
+
+This pattern suggests that while young workers are often the focus of minimum wage discussions, older low-skilled workers in Hong Kong were actually the most vulnerable group and also gained substantially from the policy.
+
+
+
+
+
+# Causality Concern (The Most Important Point)
+
+We cannot strongly claim "the minimum wage caused the drop" based only on before-after comparison, because other things (economic recovery, seasonal effects, etc.) could be happening at the same time.
+
+
+# Robustness test (very weak tho) 
+a simple before-after comparison is suggestive but not conclusive proof of causality. A Robustness test is a good way to strengthen your argument.
+
+We test whether we see similar "drops" in low-wage shares in fake treatment periods (years/quarters where no minimum wage was introduced). If we only see a big drop in 2011Q2/Q3 but not in other years, it strengthens the case that the minimum wage mattered.
+
+## Proportion below HK 28 over time
+
+```{r}
+# === PLACEBO TEST: Proportion Below $28 in Different Years (with data labels) ===
+
+placebo_data <- df_focus %>%
+  filter(age_group != "Unknown", year >= 2002, year <= 2012) %>%
+  group_by(year) %>%
+  summarise(
+    `Below $28` = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+print(placebo_data)
+
+ggplot(placebo_data, aes(x = year, y = `Below $28`)) +
+  geom_line(color = "blue", linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = `Below $28`), 
+            vjust = -1, 
+            size = 3.5) +
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red") +
+  annotate("text", x = 2011, y = max(placebo_data$`Below $28`) + 0.5, 
+           label = "SMW", color = "red", hjust = -0.1) +
+  labs(title = "Robustness Test: Proportion Below HK$28 Over Time",
+       subtitle = "Big drop only after 2011 supports policy impact?",
+       x = "Year", y = "Proportion Below HK$28 (%)") +
+  scale_x_continuous(breaks = seq(2002, 2012, 1)) +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+# === PLACEBO TEST: Proportion Below $28 in Different Years (Full Range) ===
+
+placebo_data <- df_focus %>%
+  filter(age_group != "Unknown", year >= 1985, year <= 2012) %>%
+  group_by(year) %>%
+  summarise(
+    `Below $28` = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+print(placebo_data)
+
+ggplot(placebo_data, aes(x = year, y = `Below $28`)) +
+  geom_line(color = "blue", linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = `Below $28`), 
+            vjust = -1, 
+            size = 3.5) +
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red") +
+  annotate("text", x = 2011, y = max(placebo_data$`Below $28`) + 0.5, 
+           label = "SMW", color = "red", hjust = -0.1) +
+  labs(title = "Robustness Test: Proportion Below HK$28 Over Time (1985-2012)",
+       subtitle = "A decline occurred in 2011, but similar declines happened in earlier years\n(e.g., 2009, 2003)",
+       x = "Year", y = "Proportion Below HK$28 (%)") +
+  scale_x_continuous(breaks = seq(1985, 2012, by = 2)) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+
+
+
+Sharp drop only in 2011, while previous years show steady/slow decline
+
+But a single yearly drop, even if large, is not fully robust proof of causality. 
+
+“what if it was economic recovery / seasonal effects / other shocks?” then boom
+
+
+```{r}
+# === QUARTERLY PLACEBO TEST (with data labels) ===
+
+quarterly_lowwage <- df_focus %>%
+  filter(age_group != "Unknown", year >= 2008, year <= 2012) %>%
+  group_by(year, quarter) %>%
+  summarise(
+    below_28 = round(weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100, 1),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(year_quarter = paste0(year, "Q", quarter))
+
+print(quarterly_lowwage)
+
+ggplot(quarterly_lowwage, aes(x = year_quarter, y = below_28, group = 1)) +
+  geom_line(color = "blue", linewidth = 1.1) +
+  geom_point(size = 3) +
+  geom_text(aes(label = below_28), 
+            vjust = -0.8, 
+            size = 3) +
+  geom_vline(xintercept = "2011Q2", linetype = "dashed", color = "red") +
+  annotate("text", x = "2011Q2", y = max(quarterly_lowwage$below_28) + 0.5, 
+           label = "SMW Started (May 2011)", color = "red", hjust = -0.1) +
+  labs(title = "Quarterly Robustness Test: Proportion Below HK$28",
+       subtitle = "Sharp drop starting in 2011Q2 / 2011Q3 supports policy impact",
+       x = "Year-Quarter", 
+       y = "Proportion Below HK$28 (%)") +
+  scale_y_continuous(limits = c(0, max(quarterly_lowwage$below_28) + 2)) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The quarterly data does show a drop, but it's not a massive "cliff" that screams "policy effect!" — which is very common in real-world minimum wage studies.
+
+
+2011Q1 (Before): 7.5%
+2011Q2 (SMW started in May): 6.2% → already dropping
+2011Q3: 4.4% → sharp drop
+2011Q4: 4.3%
+2012 stays low (~3.6–5.6%)
+
+Robustness tests are weak
+
+The 2010Q3 dip (5.9%) shows the low-wage share can fluctuate significantly even without the policy
+
+
+## False Timing Robustness for 50-64 (the next section is all age group)
+Test Every Year 1986-2010 as a Fake Treatment
+
+1985 no 1984 data to provide drop or what not so not included, 1986 can compare to 1985 tho
+```{r}
+# Run Robustness tests for every year before 2011
+placebo_all_years_full <- map_df(1986:2010, function(fake_year) {
+  df_focus %>%
+    filter(year %in% c(fake_year - 1, fake_year),
+           age_group == "50-64 (Older)") %>%
+    group_by(year) %>%
+    summarise(prop = weighted.mean(real_hourly_wage < 28, w = weight)) %>%
+    summarise(Year = fake_year, 
+              Drop = prop[year == fake_year] - prop[year == fake_year - 1])
+})
+```
+
+
+```{r}
+drop_2011_df <- df_focus %>%
+  filter(year %in% c(2010, 2011), age_group == "50-64 (Older)") %>%
+  group_by(year) %>%
+  summarise(prop = weighted.mean(real_hourly_wage < 28, w = weight)) %>%
+  summarise(Year = 2011, 
+            Drop = prop[year == 2011] - prop[year == 2010])
+
+placebo_full <- bind_rows(placebo_all_years_full, drop_2011_df)
+```
+
+
+```{r}
+# Find the largest drop before 2011
+largest_pre_drop <- placebo_full %>%
+  filter(Year < 2011) %>%
+  summarise(max_drop = min(Drop))  # Most negative is largest improvement
+```
+
+```{r}
+# Compare 2011 to that
+compare_drops <- placebo_full %>%
+  filter(Year %in% c(2000, 2011))  # Or whatever year had largest drop
+```
+
+```{r}
+print(placebo_full)
+print(largest_pre_drop)
+print(compare_drops)
+```
+
+
+
+```{r}
+placebo_full %>%
+  mutate(is_2011 = ifelse(Year == 2011, "2011 (Actual)", "Years")) %>%
+  ggplot(aes(x = Year, y = Drop, fill = is_2011)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(Drop, 3)), 
+            vjust = ifelse(placebo_full$Drop > 0, -0.5, 1.5), 
+            size = 2.5) +
+  scale_fill_manual(values = c("Years" = "grey70", "2011 (Actual)" = "darkred")) +
+  labs(title = "Robustness Test: Year-over-Year Drops in Low-Wage Share (50-64 Workers)",
+       subtitle = "Negative = improvement. 2011 is NOT the largest drop.",
+       x = "Year", 
+       y = "Change in % below HK$28 (YoY)",
+       fill = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Largest pre-2011 drop: 1989 = -0.0922 (9.22 percentage points)
+
+2011 drop: -0.0415 (4.15 percentage points)
+
+2011 is NOT the largest drop.
+
+The drop was moderate compared to historical fluctuations
+
+1989 saw a drop more than twice as large than 20
+
+**Cannot conclude if minimum wage cause this drop**
+
+
+
+Simple before-after or DiD with another age/education group as "control" still relies on strong assumptions (parallel trends) that we cannot properly test
+
+Any unobserved shock (economic recovery, industry changes, etc.) could explain part of the drop like maybe tsunami killed a bunch of low income workers so proportion dropped etc.
+
+
+
+
+There was an acceleration in the decline starting around the time the minimum wage was implemented. However, the drop was not extremely dramatic, and the downward trend was already happening before 2011.
+
+
+
+## False timing Robustness for each age group:
+```{r}
+# Function to run Robustness test for any age group
+run_placebo_test <- function(age_group_name, start_year = 1986, end_year = 2011) {
+  df_focus %>%
+    filter(age_group == age_group_name) %>%
+    group_by(year) %>%
+    summarise(prop = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE)) %>%
+    mutate(Drop = prop - lag(prop)) %>%
+    filter(year >= start_year, year <= end_year) %>%
+    select(Year = year, Drop)
+}
+
+# Run for all three age groups
+placebo_50plus <- run_placebo_test("50-64 (Older)")
+placebo_prime <- run_placebo_test("30-49 (Prime-age)")
+placebo_young <- run_placebo_test("15-29 (Young)")
+
+# Add 2011 if not already there (depends on your data range)
+# Your existing drop_2011_df already has 2011 for 50-64
+```
+
+
+
+
+```{r}
+placebo_50plus %>%
+  mutate(Drop_pp = Drop * 100,
+         is_2011 = ifelse(Year == 2011, "2011 (Actual)", "Years")) %>%
+  ggplot(aes(x = Year, y = Drop_pp, fill = is_2011)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(Drop_pp, 1)), 
+            vjust = ifelse(placebo_50plus$Drop > 0, -0.5, 1.5), 
+            size = 2.5) +
+  scale_fill_manual(values = c("Years" = "grey70", "2011 (Actual)" = "darkred")) +
+  labs(title = "Robustness Test: Older Workers (50-64)",
+       subtitle = "Year-over-year change in % below HK$28 | Negative = improvement",
+       x = "Year", y = "Change (percentage points)",
+       fill = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+
+```{r}
+placebo_50plus %>%
+  filter(Year >= 1990) %>%
+  mutate(Drop_pp = Drop * 100,
+         is_2011 = ifelse(Year == 2011, "2011 (Actual)", "Years")) %>% 
+  ggplot(aes(x = Year, y = Drop_pp, fill = is_2011)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(Drop_pp, 1)), 
+            vjust = ifelse(placebo_50plus$Drop[placebo_50plus$Year >= 1990] > 0, -0.5, 1.5), 
+            size = 2.5) +
+  scale_fill_manual(values = c("Years" = "grey70", "2011 (Actual)" = "darkred")) +
+  labs(title = "Robustness Test:  Real Wage YoY% change of Older Workers (50-64) ",
+       x = "Year", y = "Change in percentage points below HK$28 (YoY)",
+       fill = "") +
+  scale_x_continuous(breaks = seq(1990, 2011, by = 3)) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+
+
+
+```{r}
+run_placebo_test <- function(age_group_name, start_year = 1986, end_year = 2012) {
+  df_focus %>%
+    filter(age_group == age_group_name) %>%
+    group_by(year) %>%
+    summarise(prop = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE)) %>%
+    mutate(Drop = prop - lag(prop)) %>%
+    filter(year >= start_year, year <= end_year) %>%
+    select(Year = year, Drop)
+}
+placebo_50plus <- run_placebo_test("50-64 (Older)")
+placebo_50plus
+```
+
+```{r}
+placebo_prime %>%
+  mutate(Drop_pp = Drop * 100,
+         is_2011 = ifelse(Year == 2011, "2011 (Actual)", "Years")) %>%
+  ggplot(aes(x = Year, y = Drop_pp, fill = is_2011)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(Drop_pp, 1)), 
+            vjust = ifelse(placebo_prime$Drop > 0, -0.5, 1.5), 
+            size = 2.5) +
+  scale_fill_manual(values = c("Years" = "grey70", "2011 (Actual)" = "darkred")) +
+  labs(title = "Robustness Test: Prime-Age Workers (30-49)",
+       subtitle = "Year-over-year change in % below HK$28 | Negative = improvement",
+       x = "Year", y = "Change (percentage points)",
+       fill = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+placebo_young %>%
+  mutate(Drop_pp = Drop * 100,
+         is_2011 = ifelse(Year == 2011, "2011 (Actual)", "Years")) %>%
+  ggplot(aes(x = Year, y = Drop_pp, fill = is_2011)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(Drop_pp, 1)), 
+            vjust = ifelse(placebo_young$Drop > 0, -0.5, 1.5), 
+            size = 2.5) +
+  scale_fill_manual(values = c("Years" = "grey70", "2011 (Actual)" = "darkred")) +
+  labs(title = "Robustness Test: Young Workers (15-29)",
+       subtitle = "Year-over-year change in % below HK$28 | Negative = improvement",
+       x = "Year", y = "Change (percentage points)",
+       fill = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+placebo_young %>%
+  mutate(Drop_pp = Drop * 100,
+         is_2011 = ifelse(Year == 2011, "2011 (Actual)", "Years")) %>%
+  ggplot(aes(x = Year, y = Drop_pp, fill = is_2011)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(Drop_pp, 1)), 
+            vjust = ifelse(placebo_young$Drop > 0, -0.5, 1.5), 
+            size = 2.5) +
+  scale_fill_manual(values = c("Years" = "grey70", "2011 (Actual)" = "darkred")) +
+  labs(title = "Robustness Test: Young Workers (15-29)",
+       subtitle = "Year-over-year change in % below HK$28 | Negative = improvement",
+       x = "Year", y = "Change (percentage points)",
+       fill = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+Age Group	2011 Drop	Historical Largest Drop	Verdict
+50-64 (Older)	~ -0.041	~ -0.092 (1989)	2011 is not special
+30-49 (Prime)	~ -0.014	~ -0.032 (1990)	2011 is similar to historical
+15-29 (Young)	~ -0.022	~ -0.113 (1990)	2011 is smaller than historical
+
+
+**Vulnerable workers (50-64) saw bigger drops in 1989 with no minimum wage**
+
+**2011 was NOT special, 2011 drops are historically unremarkable**
+
+
+
+
+
+# Conclusion, Frame the paper as a descriptive + suggestive analysis
+
+introduction of the Statutory Minimum Wage in May 2011 coincided with a noticeable reduction in the proportion of workers earning very low wages, particularly among older workers (50-64) (and those with lower education levels).
+
+
+
+While the timing and the heterogeneous pattern of changes i.e. stronger effects among the most vulnerable groups, are consistent with a policy impact, **the research design does not allow for strong causal attribution.**
+
+
+## Why is not strong causal?
+
+Survey is repeated cross-sectional rather than longitudinal, and other economic factors (such as post-financial crisis recovery) were also at play during this period.
+
+quarterly data shows that low-wage shares can fluctuate significantly even in the absence of policy changes (e.g., 2010Q2 to 2010Q3 dropped then 2010Q3 to 2010Q4 rised).
+
+Nevertheless, the sustained lower levels of very low pay after mid-2011, especially among lower-educated and older workers, provide suggestive evidence that the minimum wage ***may*** have contributed to improving outcomes for Hong Kong’s most vulnerable workers.
+
+
+# Final Answer
+
+What happened? Low-wage employment dropped after 2011.
+
+Was it caused by the minimum wage? Cannot conclude — similar drops happened before.
+
+What can we say? The drop is consistent with a policy effect, but **historical fluctuations mean causal attribution is impossible**.
+
+Is the paper worthless? No. we've documented that before-after comparisons are misleading without historical context. That's a genuine contribution.
+
+
+
+# Title of our project?
+
+Deepseek:
+
+Recommended Title Formula
+
+Theme: Descriptive / Before-After / Policy Evaluation
+
+*"The Introduction of Hong Kong's Statutory Minimum Wage: Descriptive Evidence on Changes in Low-Wage Employment by Education and Age Group"*
+    
+
+
+
+
+
+
+
+
+
+
+```{r}
+# ============================================================
+# Sensitivity Test for Age Group (50-64 Older Workers)
+# Using REAL WAGES (2011 Q2 prices)
+# Compare midpoint, lower bound, and upper bound estimates
+# ============================================================
+
+# Step 1: Define the bound maps (if not already defined)
+if (!exists("lower_bound_map")) {
+  lower_bound_map <- tibble(
+    code = str_pad(1:40, width = 2, pad = "0"),
+    lower_hkd = c(0, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,
+                  11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000,
+                  22000, 24000, 26000, 28000, 30000, 32000, 34000, 36000, 38000, 40000,
+                  42000, 44000, 46000, 48000, 50000, 60000, 70000, 80000, 90000, 100000)
+  )
+  
+  upper_bound_map <- tibble(
+    code = str_pad(1:40, width = 2, pad = "0"),
+    upper_hkd = c(1999, 2999, 3999, 4999, 5999, 6999, 7999, 8999, 9999, 10999,
+                  11999, 12999, 13999, 14999, 15999, 16999, 17999, 18999, 19999, 21999,
+                  23999, 25999, 27999, 29999, 31999, 33999, 35999, 37999, 39999, 41999,
+                  43999, 45999, 47999, 49999, 54999, 64999, 74999, 84999, 94999, 149999)
+  )
+}
+
+# Step 2: Calculate nominal hourly wages for lower and upper bounds
+df_sensitivity <- df_focus %>%
+  mutate(
+    # Lower bound hourly wage (nominal)
+    earnings_main_lower = lower_bound_map$lower_hkd[match(earnings_main, lower_bound_map$code)],
+    hourly_wage_lower_nominal = earnings_main_lower / (hours_main_employment * 4.345),
+    
+    # Upper bound hourly wage (nominal)
+    earnings_main_upper = upper_bound_map$upper_hkd[match(earnings_main, upper_bound_map$code)],
+    hourly_wage_upper_nominal = earnings_main_upper / (hours_main_employment * 4.345)
+  )
+
+# Step 3: Convert lower and upper bounds to REAL wages using CPI adjustment
+df_sensitivity <- df_sensitivity %>%
+  mutate(
+    real_hourly_wage_lower = (hourly_wage_lower_nominal / cpi_comp) * ref_cpi,
+    real_hourly_wage_upper = (hourly_wage_upper_nominal / cpi_comp) * ref_cpi
+  )
+
+# Step 4: Compare results across three methods for 50-64 Older workers
+# Note: Midpoint uses the existing real_hourly_wage from your main analysis
+sensitivity_results_age <- df_sensitivity %>%
+  filter(age_group == "50-64 (Older)", year %in% c(2008:2012)) %>%
+  group_by(year) %>%
+  summarise(
+    `Midpoint (Real)` = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Lower Bound (Real)` = weighted.mean(real_hourly_wage_lower < 28, w = weight, na.rm = TRUE) * 100,
+    `Upper Bound (Real)` = weighted.mean(real_hourly_wage_upper < 28, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# Print results
+print("Sensitivity Test Results - Older Workers (50-64) - REAL WAGES")
+print(sensitivity_results_age)
+
+# Step 5: Prepare data for plotting
+sensitivity_plot_data_age <- sensitivity_results_age %>%
+  pivot_longer(cols = c(`Midpoint (Real)`, `Lower Bound (Real)`, `Upper Bound (Real)`),
+               names_to = "method",
+               values_to = "proportion") %>%
+  mutate(method = factor(method, 
+                         levels = c("Upper Bound (Real)", "Midpoint (Real)", "Lower Bound (Real)"),
+                         labels = c("Upper Bound", "Midpoint", "Lower Bound")))
+
+# Step 6: Create the plot
+ggplot(sensitivity_plot_data_age, aes(x = year, y = proportion, color = method, shape = method)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = round(proportion, 1)), 
+            vjust = -0.8, 
+            size = 3.5, 
+            show.legend = FALSE) +
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", alpha = 0.7) +
+  annotate("text", x = 2011, y = 35, label = "SMW", 
+           color = "red", size = 4, hjust = -0.1) +
+  scale_x_continuous(breaks = seq(2008, 2012, 1)) +
+  scale_y_continuous(limits = c(0, 30),
+                     breaks = seq(0, 30, 5)) +
+  labs(title = "Sensitivity Test: Proportion Below HK$28 by \nEarnings Assumption (Real Wages)",
+       subtitle = "Older Workers (50-64) | Real wages adjusted to 2011 Q2 prices",
+       x = "Year", 
+       y = "Proportion Below HK$28 (%)",
+       color = "Assumption",
+       shape = "Assumption") +
+  scale_color_manual(values = c("Lower Bound" = "darkred",
+                                 "Midpoint" = "steelblue",
+                                 "Upper Bound" = "darkgreen")) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 11),
+        legend.text = element_text(size = 10))
+```
+
+
+```{r}
+
+
+df_focus
+
+
+```
+
+
+
+
+`
+```{r}
+## === Industry Distribution of Older Workers (50-64) ===
+
+# Make sure age_group exists
+if (!"age_group" %in% names(df_focus)) {
+  df_focus <- df_focus %>%
+    mutate(
+      age_num = as.numeric(age),
+      age_group = case_when(
+        age_num %in% 4:6 ~ "15-29 (Young)",
+        age_num %in% 7:10 ~ "30-49 (Prime-age)",
+        age_num %in% 11:13 ~ "50-64 (Older)",
+        TRUE ~ "Unknown"
+      )
+    )
+}
+
+# Industry labels (handle both HSIC v1.1 and v2.0)
+industry_labels <- tibble(
+  code = str_pad(1:23, width = 2, pad = "0"),
+  industry = c(
+    "01 Manufacturing - Food & Beverage",
+    "02 Manufacturing - Clothing & Footwear",
+    "03 Manufacturing - Paper & Printing",
+    "04 Other Manufacturing",
+    "05 Construction (Main Works)",
+    "06 Construction (Services/Fitting)",
+    "07 Construction - Decoration & Maintenance",
+    "08 Wholesale Trade",
+    "09 Retail Trade",
+    "10 Import/Export Trade",
+    "11 Restaurants / Food Services",
+    "12 Hotels / Accommodation",
+    "13 Transport & Storage",
+    "14 Communications / Postal",
+    "15 Financing",
+    "16 Insurance",
+    "17 Real Estate",
+    "18 Business / Professional Services (incl. Cleaning)",
+    "19 Public Administration",
+    "20 Education",
+    "21 Health & Social Work",
+    "22 Other Community & Personal Services",
+    "23 Others"
+  )
+)
+
+# Calculate distribution
+older_industry <- df_focus %>%
+  filter(age_group == "50-64 (Older)",
+         !is.na(industry_employed),
+         industry_employed != "99") %>%
+  mutate(industry_code = str_pad(industry_employed, width = 2, pad = "0")) %>%
+  left_join(industry_labels, by = c("industry_code" = "code")) %>%
+  group_by(industry, industry_code) %>%
+  summarise(
+    n_unweighted = n(),
+    weighted_pop = sum(weight, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct = round(weighted_pop / sum(weighted_pop) * 100, 1)
+  ) %>%
+  arrange(desc(pct))
+
+# Display nice table
+older_industry %>%
+  select(`Industry Code` = industry_code,
+         Industry = industry,
+         `Weighted %` = pct,
+         `Weighted Population` = weighted_pop) %>%
+  kable(digits = 1, caption = "Industry Distribution of Older Workers (50-64)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+
+
+
+
+```{r fig.width=10, fig.height=10}
+## === Proportion Below HK$28 by Industry - Older Workers (50-64) ===
+
+# 1. Create the aggregated data (similar to prop_educ)
+prop_industry_older <- df_focus %>%
+  filter(age_group == "50-64 (Older)",
+         !is.na(industry_employed),
+         industry_employed != "99",
+         !is.na(real_hourly_wage)) %>%
+  mutate(industry_code = str_pad(industry_employed, width = 2, pad = "0")) %>%
+  left_join(industry_labels, by = c("industry_code" = "code")) %>%
+  group_by(year, industry, industry_code) %>%
+  summarise(
+    below_28 = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    n = n(),
+    weighted_pop = sum(weight, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 30)  # Minimum sample size per year-industry cell
+
+# 2. Keep only industries with sufficient data points (like your education chart)
+valid_industries <- prop_industry_older %>%
+  group_by(industry) %>%
+  summarise(n_years = n(), .groups = "drop") %>%
+  filter(n_years >= 6) %>%           # Adjust threshold as needed
+  pull(industry)
+
+prop_industry_filtered <- prop_industry_older %>%
+  filter(industry %in% valid_industries)
+
+# 3. Plot - Similar style to your education chart
+ggplot(prop_industry_filtered, aes(x = year, y = below_28, color = industry)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  geom_text(aes(label = round(below_28, 1)),
+            vjust = -0.8, size = 3.4, show.legend = FALSE) +
+  scale_x_continuous(breaks = seq(2002, 2012, by = 2)) +
+  labs(title = "Proportion Earning Below Real HK$28 by Industry",
+       subtitle = "Older Workers (50-64) | Real wages in 2011 prices | Major industries only",
+       x = "Year", 
+       y = "Proportion (%)") +
+  
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", linewidth = 0.85) +
+  annotate("text", x = 2011, y = Inf, label = "SMW", 
+           color = "red", size = 4.5, hjust = -0.15, vjust = 1.6) +
+  
+  theme_minimal(base_size = 13.5) +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 11))
+```
+```{r }
+
+# Threshold test for HK$23, HK$28, HK$33 - Older Workers (50-64)
+threshold_test_age <- df_focus %>%
+  filter(age_group == "50-64 (Older)", year %in% seq(2000, 2012)) %>%
+  group_by(year) %>%
+  summarise(
+    below_23 = weighted.mean(real_hourly_wage < 23, w = weight, na.rm = TRUE) * 100,
+    below_28 = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    below_33 = weighted.mean(real_hourly_wage < 33, w = weight, na.rm = TRUE) * 100
+  )
+
+print(threshold_test_age)
+
+# Prepare data for plotting
+threshold_plot_data_age <- threshold_test_age %>%
+  pivot_longer(cols = c(below_23, below_28, below_33),
+               names_to = "threshold",
+               values_to = "proportion") %>%
+  mutate(threshold = factor(threshold,
+                            levels = c("below_23", "below_28", "below_33"),
+                            labels = c("Below HK$23", "Below HK$28", "Below HK$33")))
+
+# Create the plot
+ggplot(threshold_plot_data_age, aes(x = year, y = proportion, color = threshold, shape = threshold)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  geom_text(aes(label = round(proportion, 1)),
+            vjust = -0.8,
+            size = 3,
+            show.legend = FALSE) +
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", alpha = 0.7) +
+  annotate("text", x = 2011, y = 45, label = "SMW Implemented (May 2011)",
+           color = "red", size = 3.5, hjust = -0.05) +
+  scale_x_continuous(breaks = seq(2000, 2012, 2)) +
+  scale_y_continuous(limits = c(0, 30), breaks = seq(0, 30, 10)) +
+  labs(title = "Proportion Below Different Thresholds (HK$23, HK$28, HK$33)",
+       subtitle = "Older Workers (50-64) | Real wages adjusted to 2011 Q2 prices",
+       x = "Year",
+       y = "Proportion (%)",
+       color = "Threshold",
+       shape = "Threshold") +
+  scale_color_manual(values = c("Below HK$33" = "darkgreen",
+                                 "Below HK$28" = "steelblue",
+                                 "Below HK$23" = "darkred")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 11),
+        legend.text = element_text(size = 10))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

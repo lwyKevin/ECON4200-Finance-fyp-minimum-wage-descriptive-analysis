@@ -1,0 +1,846 @@
+---
+title: "ECON4200"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    fig_crop: false
+
+
+
+header-includes:
+  - \usepackage[table]{xcolor}
+  - \usepackage{booktabs}
+  - \usepackage{caption}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{colortbl}
+
+date: "2026-04-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  dev = "cairo_pdf",
+  out.width = "100%",
+  cache = FALSE,          # ← Add this line
+  fig.path = "figs/" # This forces a clean folder named 'figs' in your directory
+)
+options(scipen = 999)
+```
+
+
+
+
+
+# Setting up
+
+load library
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ggridges)
+library(Hmisc)
+library(kableExtra)
+library(knitr)
+library(huxtable)
+
+```
+
+earning code mapping
+```{r, echo=TRUE}
+earnings_map <- tibble(
+  code = str_pad(1:40, width = 2, pad = "0"),
+  midpoint_hkd = c(1000,2500,3500,4500,5500,6500,7500,8500,9500,
+                   10500,11500,12500,13500,14500,15500,16500,17500,
+                   18500,19500,21000,23000,25000,27000,29000,31000,
+                   33000,35000,37000,39000,41000,43000,45000,47000,
+                   49000,55000,65000,75000,85000,95000,120000)
+)
+
+other_earnings_map <- tibble(
+  code = str_pad(1:11, width = 2, pad = "0"),
+  midpoint_hkd = c(500,1500,2500,3500,4500,5500,6500,7500,8500,9500,12000)
+)
+```
+
+
+Load all files + calculate est hourly wage
+
+survey does not give hourly wage directly
+Monthly earning is in code e.g., code "01" = < HK$2,000, code "02" = HK$2,000–2,999, etc.
+Hours worked in the last 7 days (or in main employment)
+
+convert the monthly banded earnings into an approximate hourly rate
+
+using midpoint of ranges divide hours work will give hourly wage
+
+hours_main_employment = "Hours worked in main employment (for employed persons)" → This is hours worked in the main job only during the past 7 days.
+
+hours_main_employment * 4.345 is monthly working hour
+
+hours_7days = "Hours worked during the seven days before enumeration" → This is total hours across all jobs in the past 7 days.
+
+hours_7days * 4.345 is monthly working hour
+
+care more about hours_main_employment first cuz earnings_main is for the main job, earnings_employed is total earnings
+
+
+```{r}
+files <- list.files("data_csv", pattern = "*.csv", full.names = TRUE)
+df_raw <- files %>% map_df(~read_csv(.x, col_types = cols(.default = "c")))
+
+df <- df_raw %>%
+  mutate(
+    year_quarter = str_trim(as.character(year_quarter)),
+    year = as.integer(str_sub(year_quarter, 1, 4)),
+    quarter = as.integer(str_sub(year_quarter, 5, 5)),
+    date = yq(paste0(year, "-Q", quarter)),
+    
+    across(c(earnings_main, earnings_employed, earnings_other),
+           ~ str_pad(as.character(.), width = 2, pad = "0", side = "left")),
+    
+    earnings_main_hkd     = earnings_map$midpoint_hkd[
+      match(earnings_main, earnings_map$code)],
+    
+    earnings_employed_hkd = earnings_map$midpoint_hkd[
+      match(earnings_employed, earnings_map$code)],
+    
+    earnings_other_hkd    = other_earnings_map$midpoint_hkd[
+      match(earnings_other, other_earnings_map$code)],
+    
+    across(c(hours_main_employment, hours_7days),
+           ~ case_when(.x %in% c("999","99","","NA") ~ NA_real_, TRUE ~ as.numeric(.x))),
+    
+    hourly_wage = case_when(
+      !is.na(earnings_main_hkd) & !is.na(hours_main_employment) & hours_main_employment > 0 ~
+        earnings_main_hkd / (hours_main_employment * 4.345),
+      !is.na(earnings_employed_hkd) & !is.na(hours_7days) & hours_7days > 0 ~
+        earnings_employed_hkd / (hours_7days * 4.345),
+      TRUE ~ NA_real_
+    ),
+    
+    is_employed       = economic_status %in% c("1","2","3"),
+    working_age       = age %in% str_pad(4:13, 2, pad = "0"),
+    not_foreign_helper = foreign_helper != "1" | is.na(foreign_helper),
+    not_underemployed  = underemployed != "1",
+    weight = as.numeric(grossing_up_factor) / 1e12
+  ) %>%
+  filter(!is.na(date), year >= 1985)
+```
+
+filter stuff
+
+```{r}
+df_focus <- df %>%
+  filter(is_employed, working_age, not_foreign_helper, not_underemployed,
+         !is.na(hourly_wage), hourly_wage > 0,
+         hours_main_employment >= 8 | is.na(hours_main_employment)) %>%
+  mutate(
+    year_group = case_when(
+      year <= 1989 ~ "1985-1989",
+      year >= 1990 & year <= 1994 ~ "1990-1994",
+      year >= 1995 & year <= 1999 ~ "1995-1999",
+      year >= 2000 & year <= 2004 ~ "2000-2004",
+      year >= 2005 & year <= 2009 ~ "2005-2009",
+      year >= 2010 & year <= 2012 ~ "2010-2012",
+      TRUE ~ "Other"
+    )
+  )
+```
+
+# Nominal Wage
+## Figure 1: Long term wage growth
+```{r}
+# 1. Weighted Long-term Ridge Plot
+ggplot(df_focus %>% filter(hourly_wage <= 160), 
+       aes(x = hourly_wage, y = year_group, fill = year_group, weight = weight)) +
+  geom_density_ridges(scale = 3.5, alpha = 0.85, rel_min_height = 0.01) +
+  labs(title = "Weighted Hourly Wage Distribution Over Time (1985–2012)",
+       subtitle = "Employed working-age persons, excl. foreign helpers and underemployed",
+       x = "Estimated Hourly Wage (HK$)", y = "Period") +
+  theme_ridges() +
+  theme(legend.position = "none")
+```
+From 1985–1989 the distribution was heavily concentrated at very low wages (peak around HK$20–30/hour).
+Over time, it shifted strongly to the right. By 2010–2012, the peak is around HK$40–60/hour, and very few people are below HK$30.
+
+Hong Kong experienced strong long-term wage growth from 1985 to 2012. The hourly wage distribution shifted significantly to the right over the decades, with the lower tail becoming much thinner. By the late 2000s, very few workers were earning extremely low wages. When the Statutory Minimum Wage of HK$28 per hour was introduced in May 2011, the wage floor was already relatively high for most employed working-age persons. As a result, we do not observe a dramatic visible shift in the overall wage distribution immediately around 2011. The policy likely had limited aggregate impact because it was not highly binding for the majority of the workforce
+
+
+
+## Figure 2: Weighted Lower Tail Quantiles
+```{r}
+# 2. Weighted Lower Tail Quantiles
+quantile_weighted <- df_focus %>%
+  filter(!is.na(weight), weight > 0, !is.na(hourly_wage)) %>%
+  group_by(year) %>%
+  summarise(
+    `5th`  = Hmisc::wtd.quantile(hourly_wage, weights = weight, probs = 0.05, type = "i/n"),
+    `10th` = Hmisc::wtd.quantile(hourly_wage, weights = weight, probs = 0.10, type = "i/n"),
+    `25th` = Hmisc::wtd.quantile(hourly_wage, weights = weight, probs = 0.25, type = "i/n"),
+    `50th` = Hmisc::wtd.quantile(hourly_wage, weights = weight, probs = 0.50, type = "i/n"),
+    .groups = "drop"
+  )
+ggplot(quantile_weighted, aes(x = year)) +
+  geom_line(aes(y = `5th`, color = "5th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `10th`, color = "10th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `25th`, color = "25th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `50th`, color = "Median"), linewidth = 1.1, linetype = "dashed") +
+  geom_hline(yintercept = 28, linetype = "dotted", color = "darkgreen", linewidth = 1) +
+  annotate("text", x = 2005, y = 30, label = "SMW HK$28 (2011)", color = "darkgreen", size = 4) +
+  labs(title = "Weighted Lower Tail Quantiles of Hourly Wage",
+       subtitle = "5th, 10th, 25th percentiles and Median",
+       x = "Year", y = "Hourly Wage (HK$)") +
+  scale_color_manual(values = c("5th percentile" = "red", "10th percentile" = "orange", 
+                                "25th percentile" = "blue", "Median" = "black")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(), legend.position = "top")
+```
+
+
+
+
+
+
+
+
+## Figure 3: Weighted Proportion Below Thresholds
+
+```{r}
+# 3. Weighted Proportion Below Thresholds
+prop_weighted <- df_focus %>%
+  group_by(year) %>%
+  summarise(
+    `Below HK$28` = weighted.mean(hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below HK$35` = weighted.mean(hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below HK$40` = weighted.mean(hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(year>=1997) %>%
+  pivot_longer(cols = -year, names_to = "threshold", values_to = "proportion")
+
+ggplot(prop_weighted, aes(x = year, y = proportion, color = threshold, 
+                          label = round(proportion, 1))) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  # Add geom_text to display the 'proportion' values
+  geom_text(
+    vjust = -1.2,          # Nudges text upward so it doesn't sit on the point
+    size = 3.5,            # Adjust text size
+    show.legend = FALSE    # Removes the 'a' from the color legend
+  ) +
+  labs(title = "Weighted Proportion Below Various Hourly Thresholds",
+       subtitle = "Using grossing_up_factor / 1e12, 1997Q1 to 2012Q4",
+       x = "Year", y = "Proportion (%)") +
+  # Expand the y-axis slightly so top labels aren't cut off by the plot edge
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme_minimal(base_size = 13)
+```
+
+### Fig3's YoY % change
+```{r prepare-nominal-yoy}
+# Calculate Year-over-Year % change for nominal proportions
+nominal_yoy <- prop_weighted %>%
+  group_by(threshold) %>%
+  arrange(year) %>%
+  mutate(yoy_pct = (proportion - lag(proportion)) / lag(proportion) * 100) %>%
+  ungroup() %>%
+  filter(year >= 2008 & year <= 2012) %>%   # Same period as before
+  select(year, threshold, yoy_pct) %>%
+  pivot_wider(names_from = threshold, values_from = yoy_pct) %>%
+  drop_na()
+nominal_yoy
+```
+
+if the % change is <0 i.e. decrease then red in color, else black, obviously the trend in above pic is always decreasing so only red exist
+
+Below for Diagnostic Uses, Check 2011 numbers from both methods on the SAME df_focus
+
+Can ignore
+
+The reason this exist is i didnt use type = "i/n"in fig 2 so caused 2011 no one below min wages which is not same with fig 3's 2011
+
+```{r}
+df_2011 <- df_focus %>% filter(year == 2011)
+
+cat("Number of observations in 2011:", nrow(df_2011), "\n")
+cat("Sum of weights in 2011:", sum(df_2011$weight, na.rm = TRUE), "\n\n")
+
+# 5th percentile (weighted) - ADDED type = "i/n"
+p5 <- Hmisc::wtd.quantile(df_2011$hourly_wage, 
+                          weights = df_2011$weight, 
+                          probs = 0.05, 
+                          type = "i/n") # <--- Critical change here
+
+cat("5th percentile in 2011:", round(p5, 2), "\n")
+
+# Proportion below $28 (weighted)
+prop28 <- weighted.mean(df_2011$hourly_wage < 28, w = df_2011$weight, na.rm = TRUE) * 100
+cat("Proportion below HK$28 in 2011:", round(prop28, 2), "%\n")
+
+
+p5_8 <- Hmisc::wtd.quantile(df_2011$hourly_wage, 
+                          weights = df_2011$weight, 
+                          probs = 0.058, 
+                          type = "i/n") # <--- Critical change here
+cat("5.8th percentile in 2011:", round(p5_8, 2), "\n")
+```
+5th percentile is now HK$27.09, which is logically consistent with 5.78% of the population being below HK$28.
+
+
+
+## Figure 4: Weighted Before vs After
+
+```{r}
+# 4. Weighted Before vs After (Clean & Clear)
+weighted_event <- df_focus %>%
+  filter(year >= 2008, year <= 2012) %>%
+  mutate(
+    period = if_else(date < as.Date("2011-05-01"),
+                     "Before\n(2008 Q1 – 2011 Q1)",
+                     "After\n(2011 Q2 – 2012 Q4)")
+  ) %>%
+  group_by(period) %>%
+  summarise(
+    `Below HK$28` = weighted.mean(hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below HK$35` = weighted.mean(hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below HK$40` = weighted.mean(hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(weighted_event)
+
+# Bar chart
+ggplot(weighted_event %>% pivot_longer(cols = starts_with("Below"), 
+                                       names_to = "threshold", 
+                                       values_to = "proportion"),
+       aes(x = threshold, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, size = 4.8, fontface = "bold") +
+  labs(title = "Proportion Below Hourly Thresholds: Before vs After May 2011",
+       subtitle = "Weighted | 2008 Q1 – 2011 Q1 vs 2011 Q2 – 2012 Q4",
+       x = "", 
+       y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before\n(2008 Q1 – 2011 Q1)" = "#1f77b4", 
+                               "After\n(2011 Q2 – 2012 Q4)" = "#ff7f0e")) +
+scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +   # Extra space on top
+  theme(plot.margin = margin(t = 20, r = 20, b = 10, l = 10))+   # Extra right margin
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(),
+        legend.position = "top")
+```
+In the period before the minimum wage (2008 Q1 – 2011 Q1), approximately 9.92% of employed working-age persons earned below HK$28 per hour. After the policy was implemented (2011 Q2 – 2012 Q4), this proportion dropped to 3.89% — a decline of 6.03 percentage points. Similar reductions are observed for the HK$35 and HK$40 thresholds
+
+**This suggests that after the Statutory Minimum Wage came into effect, fewer workers were earning very low hourly wages.**
+
+
+
+
+
+
+
+
+We now have:
+
+- Long-term rightward shift in the wage distribution (Image 1)
+- Clear improvement in the lower tail quantiles, with the 5th percentile reaching ~27.09 in 2011 (Image 2)
+- A visible drop in the proportion below HK$28 from ~9.3% in 2010 to 5.8% in 2011 (Image 3)
+- A 6 percentage point drop in the before vs after comparison (Image 4)
+
+
+There appears to be some acceleration in the compression of the lower tail around 2010–2012, coinciding with the introduction of the Statutory Minimum Wage in May 2011. The proportion of workers earning below HK$28 dropped noticeably from 9.3% in 2010 to 5.8% in 2011, while the 5th percentile reached approximately HK$27.09 in 2011.
+
+
+# Real Wage (CPI)
+The graphs gen are nominal wage based
+
+To get real wage we wil use cpi
+
+We use https://www.censtatd.gov.hk/en/web_table.html?id=510-60001&full_series=1#
+
+This gives us hk consumer price index MONTHLY
+
+```{r}
+# 1. Read the CSV (skipping the header metadata)
+raw_cpi <- read_csv("Table 510-60001_en.csv", skip = 4)
+
+# 2. Clean the columns
+
+cleaned_cpi <- raw_cpi %>%
+  rename(Year = 1, Month = 2, Comp_Index = 3, CPIA_Index = 6) %>%
+  fill(Year) %>%
+  filter(!is.na(Month)) %>%
+  # Convert Year to numeric here!
+  mutate(Year = as.numeric(Year)) %>% 
+  mutate(across(c(Comp_Index, CPIA_Index), as.numeric)) %>%
+  filter(Year >= 1985 & Year <= 2012)
+knitr::kable(head(cleaned_cpi))
+```
+
+but monthly not too suit so we use quarterly, 
+
+basically jan + feb + mar /3 = q1 cpi etc
+
+```{r}
+# 3. Map months to Quarters and aggregate
+cpi_quarterly <- cleaned_cpi %>%
+  mutate(quarter = case_when(
+    Month %in% c("Jan", "Feb", "Mar") ~ 1,
+    Month %in% c("Apr", "May", "Jun") ~ 2,
+    Month %in% c("Jul", "Aug", "Sep") ~ 3,
+    Month %in% c("Oct", "Nov", "Dec") ~ 4
+  )) %>%
+  group_by(Year, quarter) %>%
+  dplyr::summarize(
+    cpi_comp = mean(Comp_Index, na.rm = TRUE),
+    cpi_a = mean(CPIA_Index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(head(cpi_quarterly, 3))
+```
+
+
+```{r}
+# Automatically find the 2011 Q2 Composite CPI value to use as the Anchor
+ref_cpi <- cpi_quarterly %>%
+  filter(Year == 2011, quarter == 2) %>%
+  pull(cpi_comp)
+
+# This will print the value (it should be 78.0 based on your CSV)
+print(paste("2011 Q2 Reference CPI Value is:", ref_cpi))
+```
+
+Real hourly wage = nominal hourly wage / current CPI * reference CPI
+
+For years like 2012, where the CPI is higher than the 2011 reference (e.g., 82.5 vs 78.0), the calculation slightly reduces the salary.
+
+The Logic: It shows that even if you earned more "paper money" in 2012, you couldn't buy quite as much with it as you could in 2011 because prices went up.
+
+For years like 1985, where the CPI is much lower than the reference (e.g., 28.9 vs 78.0), the calculation increases the nominal salary significantly.
+
+The Logic: It reflects the fact that $11 in 1985 had the same "buying power" as roughly $30 in 2011. By boosting the 1985 number, we can see if that worker was actually "better off" than a minimum wage worker today.
+
+
+The result: 
+Even though Worker A earned fewer "dollars" ($11 vs $28), the math shows that Worker A was actually wealthier in real terms ($29.68 vs $28.00) because things were so much cheaper in 1985.
+
+
+### Example of Wage Adjustment (Real vs Nominal)
+
+```{r wage-comparison-table}
+# Creating the example data
+example_df <- data.frame(
+  Worker = c("Worker A", "Worker B"),
+  Year = c(1985, 2011),
+  Nominal_Wage = c(11.00, 28.00),
+  CPI = c(28.9, 78.0),
+  Calculation = c("(11.00 / 28.9) * 78.0", "(28.00 / 78.0) * 78.0"),
+  Real_Wage_2011 = c(29.68, 28.00)
+)
+
+# Formatting the table for a tidy PDF output
+kable(example_df, 
+      col.names = c("Worker", "Year", "Nominal Wage", "CPI", "Calculation", "Real Wage (2011 HKD)"),
+      caption = "Comparison of Nominal vs. Real Purchasing Power",
+      booktabs = TRUE, 
+      align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), 
+                full_width = F) %>%
+  column_spec(6, bold = TRUE, color = "green")
+
+```
+
+Formula: Real hourly wage = nominal hourly wage / current CPI * reference CPI
+
+Join the CPI quarterly data and calculate the Real Wage
+
+Quick check to ensure the new column is there
+
+```{r}
+# Join the CPI quarterly data and calculate the Real Wage
+df_final <- df_focus %>%
+  # Join on Year and Quarter (ensure column names match: 'year' in df, 'Year' in cpi)
+  left_join(cpi_quarterly, by = c("year" = "Year", "quarter" = "quarter")) %>%
+  
+  # Calculate Real Wage using the ref_cpi (78.0) we found earlier
+  mutate(
+    real_hourly_wage = (hourly_wage / cpi_comp) * ref_cpi
+  )
+
+# Quick check to ensure the new column is there
+knitr::kable(head(df_final %>% select(year, quarter, hourly_wage, real_hourly_wage)))
+```
+
+
+
+```{r}
+# Filter the main survey data to create your research focus group
+df_focus <- df %>%
+  filter(
+    is_employed == 1,              # Only those currently working
+    working_age == 1,              # Usually 15-64
+    not_foreign_helper == 1,       # Foreign domestic helpers have a different wage system
+    not_underemployed == 1,        # Focus on stable employment
+    !is.na(hourly_wage),           # Remove missing wages
+    hourly_wage > 0                # Remove data errors
+  )
+```
+
+
+
+```{r}
+df_focus <- df %>%
+  filter(is_employed, working_age, not_foreign_helper, not_underemployed,
+         !is.na(hourly_wage), hourly_wage > 0,
+         hours_main_employment >= 8 | is.na(hours_main_employment)) %>%
+  # Explicitly map the lowercase 'year' to the uppercase 'Year'
+  left_join(cpi_quarterly, by = c("year" = "Year", "quarter" = "quarter")) %>% 
+  mutate(
+    # NOTE: Ensure you use 'cpi_comp' here if that's what you named it in summarize
+    real_hourly_wage = (hourly_wage / cpi_comp) * ref_cpi,
+    
+    year_group = case_when(
+      year <= 1989 ~ "1985-1989",
+      year >= 1990 & year <= 1994 ~ "1990-1994",
+      year >= 1995 & year <= 1999 ~ "1995-1999",
+      year >= 2000 & year <= 2004 ~ "2000-2004",
+      year >= 2005 & year <= 2009 ~ "2005-2009",
+      year >= 2010 & year <= 2012 ~ "2010-2012",
+      TRUE ~ "Other"
+    )
+  )
+```
+## Fig 1 Real wage long term growth
+
+```{r}
+ggplot(df_focus %>% filter(real_hourly_wage <= 200), 
+       aes(x = real_hourly_wage, y = year_group, fill = year_group, weight = weight)) +
+  geom_density_ridges(scale = 3.5, alpha = 0.85, rel_min_height = 0.01) +
+  labs(title = "Weighted REAL Hourly Wage Distribution (1985–2012)",
+       subtitle = "Adjusted to 2011 Prices | Excl. foreign helpers & underemployed",
+       x = "Real Hourly Wage (HK$ in 2011 terms)", y = "Period") +
+  theme_ridges() +
+  theme(legend.position = "none")
+```
+
+## Figure 2: Real Wage Lower Tail Quantiles
+```{r}
+quantile_real <- df_focus %>%
+  filter(!is.na(weight), weight > 0, !is.na(real_hourly_wage)) %>%
+  group_by(year) %>%
+  summarise(
+    `5th`  = Hmisc::wtd.quantile(real_hourly_wage, weights = weight, probs = 0.05, type = "i/n"),
+    `10th` = Hmisc::wtd.quantile(real_hourly_wage, weights = weight, probs = 0.10, type = "i/n"),
+    `25th` = Hmisc::wtd.quantile(real_hourly_wage, weights = weight, probs = 0.25, type = "i/n"),
+    `50th` = Hmisc::wtd.quantile(real_hourly_wage, weights = weight, probs = 0.50, type = "i/n"),
+    .groups = "drop"
+  )
+
+ggplot(quantile_real, aes(x = year)) +
+  geom_line(aes(y = `5th`, color = "5th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `10th`, color = "10th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `25th`, color = "25th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `50th`, color = "Median"), linewidth = 1.1, linetype = "dashed") +
+  geom_hline(yintercept = 28, linetype = "dotted", color = "darkgreen", linewidth = 1) +
+  annotate("text", x = 1995, y = 31, label = "2011 SMW Threshold ($28)", color = "darkgreen") +
+  labs(title = "Weighted Lower Tail Quantiles (REAL Wages)",
+       subtitle = "Values shown in 2011 Purchasing Power",
+       x = "Year", y = "Real Hourly Wage (HK$)") +
+  scale_color_manual(values = c("5th percentile" = "red", "10th percentile" = "orange", 
+                                "25th percentile" = "blue", "Median" = "black")) +
+  
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", linewidth = 0.8) +
+annotate("text", x = 2011, y = Inf, label = "SMW", color = "red", size = 4, hjust = -0.2, vjust = 1.5)+
+  
+  
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(), legend.position = "top")
+```
+
+```{r}
+## Figure 2: Real Wage Lower Tail Quantiles
+
+quantile_real <- df_focus %>%
+  filter(!is.na(weight), weight > 0, !is.na(real_hourly_wage)) %>%
+  group_by(year) %>%
+  summarise(
+    `5th`  = Hmisc::wtd.quantile(real_hourly_wage, weights = weight, probs = 0.05, type = "i/n"),
+    `10th` = Hmisc::wtd.quantile(real_hourly_wage, weights = weight, probs = 0.10, type = "i/n"),
+    `25th` = Hmisc::wtd.quantile(real_hourly_wage, weights = weight, probs = 0.25, type = "i/n"),
+    `50th` = Hmisc::wtd.quantile(real_hourly_wage, weights = weight, probs = 0.50, type = "i/n"),
+    .groups = "drop"
+  )
+
+ggplot(quantile_real, aes(x = year)) +
+  geom_line(aes(y = `5th`, color = "5th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `10th`, color = "10th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `25th`, color = "25th percentile"), linewidth = 1.2) +
+  geom_line(aes(y = `50th`, color = "Median"), linewidth = 1.1, linetype = "dashed") +
+  
+  # Reference line for SMW threshold
+  geom_hline(yintercept = 28, linetype = "dotted", color = "darkgreen", linewidth = 0.8) +
+  
+  # Vertical line at 2011
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "gray50", linewidth = 0.6) +
+  
+  # Label for SMW threshold (horizontal line)
+  annotate("text", x = 1995, y = 29.5, label = "HK$28 SMW Threshold", color = "darkgreen", size = 3.5) +
+  
+  # Label for 2011 (vertical line) - place at bottom
+  annotate("text", x = 2011, y = 22, label = "SMW\nImplemented", color = "gray30", size = 3, vjust = 1) +
+  
+  labs(title = "Weighted Lower Tail Quantiles (REAL Wages)",
+       subtitle = "Values shown in 2011 Purchasing Power",
+       x = "Year", y = "Real Hourly Wage (HK$)") +
+  
+  scale_color_manual(values = c("5th percentile" = "red", 
+                                "10th percentile" = "orange", 
+                                "25th percentile" = "blue", 
+                                "Median" = "black")) +
+  
+  #scale_x_continuous(breaks = seq(1995, 2012, by = 3)) +
+  
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(), 
+        legend.position = "top")
+```
+
+
+## Figure 3: Proportion Below Real Thresholds
+
+```{r}
+## Figure 3: Proportion Below Real Thresholds
+
+prop_real <- df_focus %>%
+  group_by(year) %>%
+  summarise(
+    `Below Real $28` = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below Real $35` = weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below Real $40` = weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(year >= 2004) %>%
+  pivot_longer(cols = -year, names_to = "threshold", values_to = "proportion")
+
+ggplot(prop_real, aes(x = year, y = proportion, color = threshold, label = round(proportion, 1))) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  geom_text(vjust = -1.2, size = 3.5, show.legend = FALSE) +
+  geom_vline(xintercept = 2011, linetype = "dashed", color = "red", linewidth = 0.8) +
+  annotate("text", x = 2011, y = max(prop_real$proportion) + 1, 
+           label = "SMW", color = "red", size = 3.5, hjust = -0.1) +
+  labs(title = "Proportion Below REAL Hourly Thresholds",
+       subtitle = "How many earned less than $28/hr (in 2011 dollars) over time?",
+       x = "Year", y = "Proportion (%)") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme_minimal(base_size = 13)
+```
+
+### Fig3's YoY % change 
+
+```{r prepare-yoy-data}
+library(dplyr)
+
+# Prepare the yoy_summary (this will be available in your R environment)
+yoy_summary <- prop_real %>%
+  group_by(threshold) %>%
+  arrange(year) %>%
+  mutate(yoy_pct = (proportion - lag(proportion)) / lag(proportion) * 100) %>%
+  ungroup() %>%
+  filter(year >= 2008 & year <= 2012) %>%
+  select(year, threshold, yoy_pct) %>%
+  pivot_wider(names_from = threshold, values_from = yoy_pct) %>%
+  drop_na() %>%
+  mutate(year = as.integer(year))
+yoy_summary
+```
+
+
+
+## Figure 4: Before vs After (Real Wages)
+
+```{r}
+real_event <- df_focus %>%
+  filter(year >= 2008, year <= 2012) %>%
+  mutate(
+    period = if_else(date < as.Date("2011-05-01"),
+                     "Before (Real)", "After (Real)")
+  ) %>%
+  group_by(period) %>%
+  summarise(
+    `Below $28` = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below $35` = weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below $40` = weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+ggplot(real_event %>% pivot_longer(cols = -period, names_to = "threshold", values_to = "proportion"),
+       aes(x = threshold, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.7), 
+            vjust = -0.5, fontface = "bold", size = 4.5) +
+  labs(title = "Real Wage Thresholds: Before vs After May 2011",
+       subtitle = "Weighted comparison using 2011 constant dollars",
+       x = "Threshold (in 2011 HKD)", y = "Proportion (%)") +
+  # 1. FIX TOP CUTOFF: mult = c(0, 0.15) adds 15% extra space to the top
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + 
+  scale_fill_manual(values = c("Before (Real)" = "grey60", "After (Real)" = "darkblue")) +
+  theme_minimal(base_size = 14) +
+  # 2. FIX RIGHT MARGIN & LEGEND: Move legend to top to prevent squishing
+  theme(legend.title = element_blank(), 
+        legend.position = "top",
+        plot.margin = margin(t = 20, r = 20, b = 10, l = 10))
+```
+
+
+```{r}
+# ============================================================
+# RIGHT BEFORE vs RIGHT AFTER (2011Q1 vs 2011Q3)
+# Aggregate: All workers
+# ============================================================
+
+weighted_sharp <- df_focus %>%
+  filter((year == 2011 & quarter == 1) | (year == 2011 & quarter == 3)) %>%
+  mutate(
+    period = if_else(quarter == 1, 
+                     "Before (2011Q1)", 
+                     "After (2011Q3)")
+  ) %>%
+  group_by(period) %>%
+  summarise(
+    `Below HK$28` = weighted.mean(real_hourly_wage < 28, w = weight, na.rm = TRUE) * 100,
+    `Below HK$35` = weighted.mean(real_hourly_wage < 35, w = weight, na.rm = TRUE) * 100,
+    `Below HK$40` = weighted.mean(real_hourly_wage < 40, w = weight, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(weighted_sharp)
+
+# Bar chart
+ggplot(weighted_sharp %>% pivot_longer(cols = starts_with("Below"), 
+                                       names_to = "threshold", 
+                                       values_to = "proportion"),
+       aes(x = threshold, y = proportion, fill = period)) +
+  geom_col(position = "dodge", width = 0.75) +
+  geom_text(aes(label = round(proportion, 1)), 
+            position = position_dodge(width = 0.75), 
+            vjust = -0.4, 
+            size = 5, 
+            fontface = "bold") +
+  labs(title = "Proportion Below Hourly Thresholds: \nRight Before vs Right After May 2011",
+       subtitle = "2011Q1 (Before) vs 2011Q3 (After) | All workers",
+       x = "", 
+       y = "Proportion (%)") +
+  scale_fill_manual(values = c("Before (2011Q1)" = "#1f77b4", 
+                               "After (2011Q3)" = "#ff7f0e")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(),
+        legend.position = "top")
+
+
+
+
+
+
+```
+
+# Then further investigation
+
+
+The aggregate data shows a continued improvement in wages and a reduction in the low-wage share around 2011, the effect appears modest in the overall population. This raises the question of whether the minimum wage had a stronger impact on specific vulnerable groups.
+Therefore, the next step is to conduct a more disaggregated analysis by examining subgroups such as:
+
+
+- Workers with lower education levels
+
+- Younger workers (e.g., aged 15–29) & prime workers maybe
+
+- Employees in traditionally low-paying industries (e.g., retail, restaurants, cleaning) actually this idea is discarded cuz there could be some high pay people like owner of restaurants that also extremely high pay then will make it weird
+
+
+By comparing the change in low-wage proportions before and after May 2011 across these groups, we can better understand the distributional effects of the policy and identify who benefited the most.
+
+
+
+
+
+
+
+
+
+## === DATA QUALITY CHECKS ===
+
+```{r data-validation}
+cat("=== Basic Data Overview ===\n")
+cat("Total rows in raw data:", nrow(df_raw), "\n")
+cat("Total rows after processing:", nrow(df), "\n")
+cat("Rows in focus sample:", nrow(df_focus), "\n\n")
+
+cat("Years covered:\n")
+print(df_focus %>% count(year, quarter) %>% arrange(year, quarter))
+
+cat("\n=== Key Variable Summary ===\n")
+summary(df_focus %>% select(hourly_wage, real_hourly_wage, weight, 
+                            hours_main_employment, earnings_main_hkd))
+
+cat("\n=== Missing Values (%) ===\n")
+df_focus %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_%") %>%
+  filter(`Missing_%` > 0) %>%
+  arrange(desc(`Missing_%`)) %>%
+  print()
+
+cat("\n=== Hourly Wage Distribution (Nominal) ===\n")
+df_focus %>%
+  summarise(
+    Min = min(hourly_wage, na.rm = TRUE),
+    P5 = quantile(hourly_wage, 0.05, na.rm = TRUE),
+    Median = median(hourly_wage, na.rm = TRUE),
+    Mean = mean(hourly_wage, na.rm = TRUE),
+    P95 = quantile(hourly_wage, 0.95, na.rm = TRUE),
+    Max = max(hourly_wage, na.rm = TRUE),
+    N = n()
+  ) %>% 
+  kable(digits = 2)
+```
+# 1. Check Earnings Mapping
+```{r check-earnings-mapping}
+cat("Unique earnings_main codes and their mapped values:\n")
+df_focus %>%
+  count(earnings_main, earnings_main_hkd) %>%
+  arrange(earnings_main) %>%
+  print(n = 30)
+```
+
+# 2. Check Weighting Factor
+```{r check-weights}
+cat("Total weighted population (should be around Hong Kong's employed population):\n")
+sum(df_focus$weight, na.rm = TRUE) %>% round(3)
+```
+
+
+# 3. Sample of Raw vs Processed Data
+```{r sample-data}
+df_focus %>%
+  select(year, quarter, earnings_main, earnings_main_hkd, 
+         hours_main_employment, hourly_wage, real_hourly_wage) %>%
+  slice_sample(n = 10) %>%
+  kable(digits = 2)
+```
+
+
+
+
+
